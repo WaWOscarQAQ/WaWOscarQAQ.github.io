@@ -1,0 +1,68 @@
+title: Str Cat
+subtitle: 记录技术、学习与生活
+description: WaWOscarQAQ 的个人博客
+author: WaWOscarQAQ
+language: zh-CN
+timezone: Asia/Shanghai
+
+url: https://wawoscarqaq.github.io
+root: /
+permalink: :year/:month/:day/:title/
+pretty_urls:
+  trailing_index: false
+  trailing_html: false
+
+source_dir: source
+public_dir: public
+tag_dir: tags
+archive_dir: archives
+category_dir: categories
+include:
+  - .nojekyll
+
+new_post_name: :title.md
+default_layout: post
+titlecase: false
+external_link:
+  enable: true
+  field: site
+  exclude: []
+filename_case: 0
+render_drafts: false
+post_asset_folder: false
+relative_link: false
+future: false
+syntax_highlighter: highlight.js
+highlight:
+  enable: true
+  line_number: true
+  auto_detect: false
+  tab_replace: ""
+  wrap: true
+  hljs: false
+prismjs:
+  enable: false
+
+index_generator:
+  path: ""
+  per_page: 10
+  order_by: -date
+default_category: uncategorized
+date_format: YYYY-MM-DD
+time_format: HH:mm:ss
+updated_option: date
+per_page: 10
+pagination_dir: page
+
+theme: redefine
+
+search:
+  path: search.xml
+  field: post
+  content: true
+  format: html
+feed:
+  type: atom
+  path: atom.xml
+  limit: 20
+  content: true

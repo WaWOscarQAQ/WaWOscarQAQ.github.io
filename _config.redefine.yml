@@ -1,0 +1,107 @@
+# Unspecified options inherit the defaults of Redefine 2.9.0.
+info:
+  title: Str Cat
+  subtitle: 记录技术、学习与生活
+  author: WaWOscarQAQ
+  url: https://wawoscarqaq.github.io
+
+defaults:
+  favicon: /images/avatar.svg
+  avatar: /images/avatar.svg
+
+colors:
+  primary: "#2d6469"
+  default_mode: light
+
+global:
+  content_max_width: 1000px
+  hover:
+    shadow: true
+    scale: false
+  scroll_progress:
+    bar: false
+    percentage: false
+  website_counter:
+    enable: false
+  single_page: true
+  side_tools:
+    gear_rotation: false
+    auto_expand: false
+  open_graph:
+    enable: true
+    image: /images/covers/default.svg
+    description: WaWOscarQAQ 的个人博客
+
+# A simple article list, without the full-screen landing banner or sidebar.
+home_banner:
+  enable: false
+
+navbar:
+  auto_hide: false
+  color:
+    left: "#eef5f3"
+    right: "#eef1f5"
+    transparency: 90
+  links:
+    首页:
+      path: /
+      icon: fa-regular fa-house
+    归档:
+      path: /archives/
+      icon: fa-regular fa-archive
+    标签:
+      path: /tags/
+      icon: fa-regular fa-tags
+    关于:
+      path: /about/
+      icon: fa-regular fa-user
+  search:
+    enable: true
+    preload: false
+
+home:
+  sidebar:
+    enable: false
+    show_on_mobile: false
+  article_date_format: YYYY-MM-DD
+  excerpt_length: 160
+
+articles:
+  style:
+    font_size: 17px
+    line_height: 1.8
+    image_border_radius: 12px
+    title_alignment: left
+  author_label:
+    enable: false
+  word_count:
+    enable: true
+    count: true
+    min2read: true
+  code_block:
+    copy: true
+    style: simple
+  toc:
+    enable: true
+    max_depth: 3
+    number: false
+  copyright:
+    enable: false
+  recommendation:
+    enable: false
+
+comment:
+  enable: false
+
+footer:
+  runtime: false
+  statistics: false
+  icon: ""
+  start: 2025/02/26 20:38:14
+
+plugins:
+  feed:
+    enable: true
+
+cdn:
+  enable: false
