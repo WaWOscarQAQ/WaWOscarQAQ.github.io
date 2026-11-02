@@ -111,6 +111,9 @@ inject:
   head:
     - |
       <style>
+        .highlight .comment {
+          font-style: normal;
+        }
         img[src$="/linux-storage-stack.webp"] {
           object-position: center 53%;
         }
