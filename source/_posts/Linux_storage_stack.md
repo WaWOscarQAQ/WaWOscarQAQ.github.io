@@ -137,9 +137,9 @@ struct bio {
 
 - `bi_iter`负责记录现在所有`bio`结构体处理到哪里，以及正在处理的`bio_vect`是哪个，同时负责调度`bi_vect`。
 
-- 当 `biv_cnt`小于`bi_inline_vecs`时，直接指向`bi_inline_vecs`    
+- 当 `biv_cnt`小于`bi_inline_vecs`时，直接指向`bi_inline_vecs`
 
-![](/home/oscarw/MySite/WaWOscarQAQ.github.io/source/images/contents/Linux_Kernel/bio_struct.png)
+![](/images/contents/Linux_Kernel/bio_struct.png)
 
 其中，具体的`bi_opf`中的可选值如下：其中低 8 位为操作类型，高 24 位为请求处理 flag
 
