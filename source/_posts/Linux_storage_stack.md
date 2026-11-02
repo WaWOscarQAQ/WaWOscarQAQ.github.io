@@ -2,8 +2,9 @@
 title: Linux 存储栈
 date: 2026-11-02
 tags: [学习笔记, Linux Kernel, 存储栈]
-thumbnail: /images/covers/Linux_storage_stack.png
-cover: /images/covers/Linux_storage_stack.png
+# Cover artwork by 陌芋marginal: https://www.pixiv.net/artworks/105115167 (Wallhaven vqpem5).
+thumbnail: /images/covers/linux-storage-stack.webp
+cover: /images/covers/linux-storage-stack.webp
 excerpt: 简单了解 Linux 存储栈的架构
 ---
 
