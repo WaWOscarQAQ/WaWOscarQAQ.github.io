@@ -111,18 +111,12 @@ inject:
   head:
     - |
       <style>
-        .home-article-thumbnail:has(img[src$="/linux-storage-stack.webp"]) {
-          width: 100%;
-          height: auto;
-          min-height: 180px;
-          aspect-ratio: 5 / 2;
-        }
-        .article-title > img[src$="/linux-storage-stack.webp"] {
-          height: auto;
-          min-height: clamp(240px, 38vw, 330px);
-          aspect-ratio: 21 / 10;
-        }
         img[src$="/linux-storage-stack.webp"] {
-          object-position: 50% 10%;
+          object-position: center 53%;
+        }
+        @media (max-width: 480px) {
+          .home-article-thumbnail img[src$="/linux-storage-stack.webp"] {
+            object-position: center 15%;
+          }
         }
       </style>
