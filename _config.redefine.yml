@@ -41,9 +41,9 @@ navbar:
   color:
     left: "#eef5f3"
     right: "#eef1f5"
-    transparency: 90
+    transparency: 10
   links:
-    首页:
+    Home:
       path: /
       icon: fa-regular fa-house
     归档:
