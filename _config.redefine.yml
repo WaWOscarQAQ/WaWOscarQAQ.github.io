@@ -105,3 +105,21 @@ plugins:
 
 cdn:
   enable: false
+
+inject:
+  enable: true
+  head:
+    - |
+      <style>
+        .highlight .comment {
+          font-style: normal;
+        }
+        img[src$="/linux-storage-stack.webp"] {
+          object-position: center 53%;
+        }
+        @media (max-width: 480px) {
+          .home-article-thumbnail img[src$="/linux-storage-stack.webp"] {
+            object-position: center 15%;
+          }
+        }
+      </style>
