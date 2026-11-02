@@ -14,8 +14,8 @@ for (const [name, html] of [['home', home], ['post', post]]) {
   assert(!html.includes('http://example.com'), `${name}: default example.com URL remains`);
   assert(!html.includes('hexo-theme-cards'), `${name}: previous theme remains`);
   assert(html.includes('/images/covers/default.svg'), `${name}: article cover is missing`);
-  for (const match of html.matchAll(/(?:src|href)=["'](\/[^"'#?]*)["']/g)) {
-    const path = decodeURIComponent(match[1]);
+  for (const match of html.matchAll(/(?:src|href)=["'](\/[^"']*)["']/g)) {
+    const path = decodeURIComponent(match[1].split(/[?#]/)[0]);
     if (path.startsWith('//')) continue;
     const file = join(root, path);
     assert(existsSync(file) || existsSync(join(file, 'index.html')), `${name}: broken internal URL ${path}`);
