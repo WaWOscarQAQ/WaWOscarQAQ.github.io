@@ -27,7 +27,7 @@ excerpt: 简单了解 Linux 存储栈的架构
 
 通用块层在`submit_bio`到`queue_rq`这段对话中，负责从`bio->request`的调度，极大提升了系统IO性能和硬件利用率
 
-## 1.1 `struct bio`
+### 1.1 `struct bio`
 
 是文件系统/页缓存/RAID/dm 到通用块层的IO请求描述，主要包括：
 
@@ -141,6 +141,8 @@ struct bio {
 
 ![](/images/contents/Linux_Kernel/bio_struct.png)
 
+#### 1.1.1 `bi_opf`
+
 其中，具体的`bi_opf`中的可选值如下：其中低 8 位为操作类型，高 24 位为请求处理 flag
 
 ```c
@@ -210,6 +212,8 @@ enum req_flag_bits {
 };
 ```
 
+#### 1.1.2 `bio_flags`
+
 `bio_flags` 有如下几种：
 
 ```c
@@ -245,3 +249,208 @@ enum {
 	BIO_FLAG_LAST
 };
 ```
+
+#### 1.1.3 `bio_vec`与`bio_iter`
+
+`bio_vec`和`bio_iter`分工明确：
+
+- `bio_vec`一个是对应 IO 请求的具体内存块；
+- `bio_iter`是请求的具体情况；
+
+其中`bvec_iter`内容如下：
+
+```c
+struct bvec_iter {
+	/*
+	 * Current device address in 512 byte sectors. Only updated by the bio
+	 * iter wrappers and not the bvec iterator helpers themselves.
+	 */
+	sector_t		bi_sector; // 现在正在处理的 bio 处于的分区
+
+	/*
+	 * Remaining size in bytes.
+	 */
+	unsigned int		bi_size; // 还剩多少字节没有处理
+
+	/*
+	 * Current index into the bvec array. This indexes into `bi_io_vec` when
+	 * iterating a bvec array that is part of a `bio`.
+	 */
+	unsigned int		bi_idx; // 目前处理到多少 bio_vec
+
+	/*
+	 * Current offset in the bvec entry pointed to by `bi_idx`.
+	 */
+	unsigned int		bi_offset; // 现在处理的 bio_vec 的 offset
+} __packed __aligned(4);
+```
+
+`bio_vec`如下：
+
+```c
+struct bio_vec {
+	struct page	*bv_page; // 指向该地址区间的第一个内存页
+	unsigned int	bv_len; // 大小
+	unsigned int	bv_offset; // 开始位置
+};
+```
+
+### 1.2 执行流程 `submit_bio`
+
+函数的功能是：将一个 bio IO 请求提交到对应的块设备上。这个函数首先完全初始化了`struct bio`结构体。这个结构体之后会被提交到被`bi_bdev`描述的指定设备上。本次请求的成功 / 失败状态，以及完成的通知，都会通过 `bio->bi_end_io ()` 回调函数以异步方式传递，在 `bi_end_io ()` 被调用之前，调用者【不得】修改或访问该 `bio`。
+
+```c
+void submit_bio(struct bio *bio)
+{
+	if (bio_op(bio) == REQ_OP_READ) { // 从设备中读取 IO
+		task_io_account_read(bio->bi_iter.bi_size); // 记录当前任务的读取字节数
+		count_vm_events(PGPGIN, bio_sectors(bio)); // 给指定的内核项加一定数值
+	} else if (bio_op(bio) == REQ_OP_WRITE) { // 向扇区内写
+		count_vm_events(PGPGOUT, bio_sectors(bio));
+	}
+
+	bio_set_ioprio(bio); // 确定 bio 的 IO 优先级
+	submit_bio_noacct(bio);
+}
+EXPORT_SYMBOL(submit_bio);
+```
+
+其中：
+
+- `task_io_account_read`记录系统读取或写入的扇区数，`PGPGIN`表示读取，`PGPGOUT`表示写入；
+- `task_io_account_read`表示在这次任务内读取的字节数，在启用`CONFIG_TASK_IO_ACCOUNTING`时生效。
+
+#### 1.2.1 `submit_bio_noacct`
+
+这个函数主要实现提交 `bio` 请求的细节，同时不再统计相关参数。它是更底层的提交请求，只能被 stacking block drivers 用于将 IO 操作交给更底层的驱动。对于用户和文件系统，应该使用`submit_bio` 。
+
+在这个函数中，主要对 bio 请求的细节进行检查（`REQ_XXX`），之后交给更底层的函数进行处理。
+
+```c
+void submit_bio_noacct(struct bio *bio)
+{
+    // 获取 bio 对应的 bi_bdev 设备
+	struct block_device *bdev = bio->bi_bdev;
+	struct request_queue *q = bdev_get_queue(bdev); // 查询设备对应的请求队列对象
+	blk_status_t status = BLK_STS_IOERR;
+
+	might_sleep();
+
+	// 这里首先检查是否支持不等待直接报错的选项 (遇到阻塞直接返回)
+    // 不支持直接返回 not_support 报错
+	if ((bio->bi_opf & REQ_NOWAIT) && !bdev_nowait(bdev))
+		goto not_supported;
+
+    // 有加密上下文时，检查是否有数据，没有数据以IO错误结束
+    // 再监测块设备是否支持 bio 不支持就进行报错
+	if (bio_has_crypt_ctx(bio)) { 
+		if (WARN_ON_ONCE(!bio_has_data(bio)))
+			goto end_io;
+		if (!blk_crypto_supported(bio))
+			goto not_supported;
+	}
+
+    // 一些会出错的情形检查
+	if (should_fail_bio(bio))
+		goto end_io;
+    // 检查是否在写一个只读设备
+	bio_check_ro(bio);
+    // 检查 IO 是否越界，即是否越过当前块设备
+	if (!bio_flagged(bio, BIO_REMAPPED)) {
+		if (unlikely(bio_check_eod(bio)))
+			goto end_io;
+		if (bdev_is_partition(bdev) &&
+		    unlikely(blk_partition_remap(bio)))
+			goto end_io;
+	}
+
+	/*
+	 * Filter flush bio's early so that bio based drivers without flush
+	 * support don't have to worry about them.
+	 */
+    // 提前过滤 flush 请求
+    // 就是将易失性的缓存进行持久化保存，防止断电消失
+	if (op_is_flush(bio->bi_opf)) {
+		if (WARN_ON_ONCE(bio_op(bio) != REQ_OP_WRITE &&
+				 bio_op(bio) != REQ_OP_ZONE_APPEND))
+			goto end_io;
+		if (!bdev_write_cache(bdev)) {
+			bio->bi_opf &= ~(REQ_PREFLUSH | REQ_FUA);
+			if (!bio_sectors(bio)) {
+				status = BLK_STS_OK;
+				goto end_io;
+			}
+		}
+	}
+
+	switch (bio_op(bio)) {
+	case REQ_OP_READ:
+		break;
+	case REQ_OP_WRITE:
+		if (bio->bi_opf & REQ_ATOMIC) {
+			status = blk_validate_atomic_write_op_size(q, bio);
+			if (status != BLK_STS_OK)
+				goto end_io;
+		}
+		break;
+	case REQ_OP_FLUSH:
+		/*
+		 * REQ_OP_FLUSH 不是通过 bio 提交的, 只能在 struct request 中
+		 * 使用 flush 状态机合成。
+		 */
+		goto not_supported;
+	case REQ_OP_DISCARD:
+		if (!bdev_max_discard_sectors(bdev))
+			goto not_supported;
+		break;
+	case REQ_OP_SECURE_ERASE:
+		if (!bdev_max_secure_erase_sectors(bdev))
+			goto not_supported;
+		break;
+	case REQ_OP_ZONE_APPEND:
+		status = blk_check_zone_append(q, bio);
+		if (status != BLK_STS_OK)
+			goto end_io;
+		break;
+	case REQ_OP_WRITE_ZEROES:
+		if (!q->limits.max_write_zeroes_sectors)
+			goto not_supported;
+		break;
+	case REQ_OP_ZONE_OPEN:
+	case REQ_OP_ZONE_CLOSE:
+	case REQ_OP_ZONE_RESET:
+	case REQ_OP_ZONE_FINISH:
+		/* Zone management operations require sequential zones. */
+		if (!bdev_zone_is_seq(bio->bi_bdev, bio->bi_iter.bi_sector))
+			goto end_io;
+		break;
+	case REQ_OP_ZONE_RESET_ALL:
+		if (!bdev_is_zoned(bio->bi_bdev))
+			goto not_supported;
+		break;
+	case REQ_OP_DRV_IN:
+	case REQ_OP_DRV_OUT:
+		/*
+		 * Driver private operations are only used with passthrough
+		 * requests.
+		 */
+		fallthrough;
+	default:
+		goto not_supported;
+	}
+
+	if (blk_throtl_bio(bio))
+		return;
+	submit_bio_noacct_nocheck(bio, false); // 更底层的封装
+	return;
+
+not_supported:
+	status = BLK_STS_NOTSUPP;
+end_io:
+	bio_endio_status(bio, status);
+}
+EXPORT_SYMBOL(submit_bio_noacct);
+```
+
+
+
