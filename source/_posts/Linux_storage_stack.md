@@ -440,7 +440,7 @@ void submit_bio_noacct(struct bio *bio)
 		goto not_supported;
 	}
 
-	if (blk_throtl_bio(bio))
+	if (blk_throtl_bio(bio)) //存在限速，会在这里拦截，之后使用 blk-throtl 调度之后提交
 		return;
 	submit_bio_noacct_nocheck(bio, false); // 更底层的封装
 	return;
@@ -453,5 +453,168 @@ end_io:
 EXPORT_SYMBOL(submit_bio_noacct);
 ```
 
+#### 1.2.2 `submit_bio_noacct_nocheck`
+
+```c
+void submit_bio_noacct_nocheck(struct bio *bio, bool split)
+{
+	if (unlikely(blk_error_inject(bio))) // unlikely() 告诉编译器结果通常为假
+		return;                          // 方便编译器优化代码布局
+
+	blk_cgroup_bio_start(bio); // cgroup 的 IO 统计工作
+
+    // bio 是否设置了完成时追踪工作
+	if (!bio_flagged(bio, BIO_TRACE_COMPLETION)) {
+		trace_block_bio_queue(bio); // bio 入队跟踪
+		/*
+		 * 既然已经设置入队跟踪, 完成时跟踪也要设置
+		 */
+		bio_set_flag(bio, BIO_TRACE_COMPLETION);
+	}
+
+	/*
+	 * 我们希望每个时刻只激活一个 submit_bio 过程, 否则堆叠块设备时会造成栈空间消耗
+	 * 这里使用 current->bio_list 记录一个 submit_bio 调用期间被提交的所有 bio
+	 * 在 submit_bio 方法回来之后，统一处理这些 bio
+	 */
+	if (current->bio_list) {
+		if (split) // 这次提交是否来自 bio 拆分路径
+		           // 所谓的拆分路径, 是指由于设备处理块数原因, 需要将原有 bio 进行拆解
+		    // 来自拆分路径，放到头部, 优先处理
+			bio_list_add_head(&current->bio_list[0], bio); 
+		else
+		    // 放到尾部，进行排队
+			bio_list_add(&current->bio_list[0], bio);
+	// 如果目标没有实现 bd_has_submit_bio
+	} else if (!bdev_test_flag(bio->bi_bdev, BD_HAS_SUBMIT_BIO)) {
+		__submit_bio_noacct_mq(bio); // 调用 mq （多队列块层）递交函数
+	} else {
+		__submit_bio_noacct(bio); // 调用设备专用 submit_bio 递交函数
+	}
+}
+	 
+```
+
+#### 1.2.3 `__submit_bio_noacct`
+
+```c
+static void __submit_bio_noacct(struct bio *bio)
+{
+    // bio_list_on_stack[0]: 本次提交任务中生成的 bio
+    // bio_list_on_stack[1]: 本次任务之前提交但没有处理的 bio
+	struct bio_list bio_list_on_stack[2];
+
+	BUG_ON(bio->bi_next); // 这里应该保证 bio->bi_next 为空, 保证 bio 是独立的
+
+	bio_list_init(&bio_list_on_stack[0]); // 初始化 bio_lisk_on_stack[0]
+	current->bio_list = bio_list_on_stack; // 绑定当前进程的 bio_list
+
+	do {
+	    // 设备的 request queue
+		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+		// lower: 指向更底层设备的 bio
+		// same: 指向当前设备的 bio
+		struct bio_list lower, same;
+
+		/*
+		 * 为下层 request 创建一个 bio_list
+		 */
+		bio_list_on_stack[1] = bio_list_on_stack[0]; // 旧的 0 备份到 1
+		bio_list_init(&bio_list_on_stack[0]); // 重新初始化 0
+
+        // 递归提交当前 bio
+        // 过程中如果出现新的 bio，挂入 bio_list_on_check[0]
+		__submit_bio(bio);
+
+		/*
+		 * 遍历本层生成的 bio, 按照目标设备队列
+		 * 如果是当前 q, 放入 same
+		 * 不是 q, 放入 lower
+		 */
+		bio_list_init(&lower);
+		bio_list_init(&same);
+		while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+			if (q == bdev_get_queue(bio->bi_bdev))
+				bio_list_add(&same, bio);
+			else
+				bio_list_add(&lower, bio);
+
+		/*
+		 * 组合提交队列：指向底层 bio 的设备优先, 其次是本设备队列, 最后是上层残留的 bio 队列
+		 */
+		bio_list_merge(&bio_list_on_stack[0], &lower);
+		bio_list_merge(&bio_list_on_stack[0], &same);
+		bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+	} while ((bio = bio_list_pop(&bio_list_on_stack[0]))); // 从 bio_list_on_stack[0] 弹出 bio 提交
+
+	current->bio_list = NULL;
+}
+```
+
+这里比较复杂：
+
+在进入循环之前, `bio`链表中只有一个元素；
+
+1. 使用`bio_list_on_stack[0]`装载这次递归的`bio`，使用`bio_list_on_stack[1]`装载之前未完成的`bio`，当前进程（`current`）绑定`bio_list_on_stack`；
+
+2. 每次使用栈 1备份栈 0，并且提交当前 `bio`，将这次提交多出的 `bio` 存放到栈 0 中；
+
+3. 对新生成的`bio`进行划分：
+
+   - 如果设备调用栈是当前的 `q`，放入`same`；
+
+   - 否则是底层设备，放入`lower`；
+
+4. 进行栈合并：优先级为：`lower` > `same` > `bio_list_on_stack[1]`
+
+上述循环结束之后，从当前`bio_list_on_stack[0]`中`pop`一个新元素，作为 `bio`投入新循环。以下是对具体栈变化的描述：
+
+![](/images/contents/Linux_Kernel/submit_bio_noacct.png)
+
+#### 1.2.4 `submit_bio_noacct_mq`
+
+```c
+static void __submit_bio_noacct_mq(struct bio *bio)
+{
+	struct bio_list bio_list[2] = { };
+
+  /* 取出当前进程的待提交 bio 列表 */
+	current->bio_list = bio_list;
+
+	do {
+		__submit_bio(bio);
+	/* 从列表中取出一个 bio, bio_list [0] 是主 bio 列表 */
+	} while ((bio = bio_list_pop(&bio_list[0]))); 
+
+	current->bio_list = NULL;
+}
+```
+
+在 mq 下不需要递归提交，根本原因是每次加入待处理链表的 bio 属于同一个请求队列，不需要进行下层请求优先的跨层排序。
+
+#### 1.2.5 `__submit_bio`
+
+```c
+static void __submit_bio(struct bio *bio)
+{
+    // 是否实现了自己提交函数
+	if (!bdev_test_flag(bio->bi_bdev, BD_HAS_SUBMIT_BIO)) {
+		blk_mq_submit_bio(bio); // 现代磁盘驱动基本使用这个函数
+	} else if (likely(bio_queue_enter(bio) == 0)) {
+	    // md raid zram stacking driver 进入这里
+		struct gendisk *disk = bio->bi_bdev->bd_disk; // 找到对应块设备的磁盘
+	
+        // bio 设置 REQ_POLLED， 通过轮询检查 I/O 完成情况
+        // 检查设备是否支持
+		if ((bio->bi_opf & REQ_POLLED) &&
+		    !(disk->queue->limits.features & BLK_FEAT_POLL))
+			bio_endio_status(bio, BLK_STS_NOTSUPP); 
+		else
+		    // 使用驱动注册的 submit_bio 提交 bio
+			disk->fops->submit_bio(bio);
+		blk_queue_exit(disk->queue); // 结束之后，blk_queue_exit() 释放队列资源
+	}
+}
+```
 
 
