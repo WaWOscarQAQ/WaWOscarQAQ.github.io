@@ -36,7 +36,8 @@ excerpt: 这篇文章的简短介绍。
 - `_config.yml`：博客标题、作者、网址、时区和永久链接。
 - `_config.redefine.yml`：主题配色、导航、文章样式。当前使用浅色、单栏文章列表，关闭全屏首页横幅、侧栏和未配置的评论服务。
 - `source/about/index.md`：关于页面。
-- `source/images/avatar.svg`：头像和网站图标。
+- `source/images/myavatar.jpeg`：网站头像，在 `_config.redefine.yml` 的 `defaults.avatar` 中配置。
+- `source/images/avatar.svg`：网站图标。
 
 原有 Hello World 文章及其 `/2025/02/26/hello-world/` 地址已保留。
 

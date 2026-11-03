@@ -7,7 +7,7 @@ info:
 
 defaults:
   favicon: /images/avatar.svg
-  avatar: /images/avatar.svg
+  avatar: /images/myavatar.jpeg
 
 colors:
   primary: "#2d6469"
