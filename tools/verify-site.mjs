@@ -23,4 +23,6 @@ for (const [name, html] of [['home', home], ['post', post]]) {
 }
 assert(post.includes('Quick Start'), 'Original article content is missing');
 assert(post.includes('https://wawoscarqaq.github.io/2025/02/26/hello-world/'), 'Original article URL is not preserved');
-console.log('Verified Redefine pages, article cover, original permalink, and local assets.');
+const tags = readFileSync(join(root, 'tags/index.html'), 'utf8');
+assert(/href=["']\/tags\/[^"'#?]+\/["']/.test(tags), 'Tag index is missing links to the generated tag pages');
+console.log('Verified Redefine pages, tag index, article cover, original permalink, and local assets.');
