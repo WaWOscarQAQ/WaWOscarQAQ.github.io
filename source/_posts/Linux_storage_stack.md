@@ -2,9 +2,8 @@
 title: Linux 存储栈
 date: 2026-11-02
 tags: [学习笔记, Linux Kernel, 存储栈]
-# Cover artwork by 陌芋marginal: https://www.pixiv.net/artworks/105115167 (Wallhaven vqpem5).
-thumbnail: /images/covers/linux-storage-stack.webp
-cover: /images/covers/linux-storage-stack.webp
+thumbnail: /images/covers/Linux_storage_stack.png
+cover: /images/covers/Linux_storage_stack.png
 excerpt: 简单了解 Linux 存储栈的架构
 ---
 
@@ -617,4 +616,266 @@ static void __submit_bio(struct bio *bio)
 }
 ```
 
+### 1.3 `struct request`
+
+```c
+struct request {
+	struct request_queue *q; // request 所属的队列，决定要去哪个块设备
+	struct blk_mq_ctx *mq_ctx; // 多队列下 request 上下文信息
+    						   // 主要识别这个 request 属于哪个 software 队列
+    						   // 通常与 CPU 绑定
+	struct blk_mq_hw_ctx *mq_hctx; // 多队列下硬件上下文
+
+	blk_opf_t cmd_flags; // 操作码和常用标志，和 bio_opf 功能类似
+	req_flags_t rq_flags; // 状态标志
+
+	int tag; // 一个 request 在请求队列中的唯一标识, 用于硬件队列和 IO 调度识别
+	int internal_tag; // 内部管理标识，主要用于在 request_pool 中管理
+
+	unsigned int timeout;
+
+	// 内部标识，永远不要外用
+	unsigned int __data_len; // request 总长度，单位是字节
+	sector_t __sector; // 扇区游标，现在处理到的扇区号
+
+	struct bio *bio; // req 对应的 bio 链表，一个 request 可以对应多个 bio
+	struct bio *biotail; // bio 链表列尾
+
+	union {
+		struct list_head queuelist; // 双向链表，将 request 加入各种队列中
+		struct request *rq_next; // 单向链表，用于 request 合并等场景
+	};
+
+	struct block_device *part; // 目标块设备 or 分区
+#ifdef CONFIG_BLK_RQ_ALLOC_TIME
+	/* Time that the first bio started allocating this request. */
+	u64 alloc_time_ns;
+#endif
+	/* Time that this request was allocated for this IO. */
+	u64 start_time_ns; // request 被分配到这个 IO 时间戳
+	/* Time that I/O was submitted to the device. */
+	u64 io_start_time_ns; // request 被提交到设备的时间戳
+
+#ifdef CONFIG_BLK_WBT
+	unsigned short wbt_flags;
+#endif
+	/*
+	 * 用于统计 request 最初的扇区数
+	 * 数值与 blk_rq_sectors(rq) 相同, 但是这个值永远不会被清零
+	 */
+	unsigned short stats_sectors;
+
+	/*
+	 * 在物理地址合并（coalescing）之后，scatter-gather DMA 地址 + 长度对的数量。
+	 * 设备在 DMA 传输时，数据地址可能分布在不同内存物理页上
+	 * Scatter-gather DMA 机制允许一次传输描述多个（物理地址，长度）对，称为 “SG 列表”。
+	 * 设备可以一次性高效读写多个不连续的 DMA 片段
+	 */
+	unsigned short nr_phys_segments;
+	unsigned short nr_integrity_segments;
+
+	/*
+	 * The lowest set bit for address gaps between physical segments. This
+	 * provides information necessary for dma optimization opprotunities,
+	 * like for testing if the segments can be coalesced against the
+	 * device's iommu granule.
+	 */
+	unsigned char phys_gap_bit;
+
+#ifdef CONFIG_BLK_INLINE_ENCRYPTION
+	struct bio_crypt_ctx *crypt_ctx;
+	struct blk_crypto_keyslot *crypt_keyslot;
+#endif
+
+	enum mq_rq_state state; // request 状态
+	atomic_t ref; // 引用计数，防止被提前释放
+
+	unsigned long deadline; // 调度 deadline，IO scheduler 
+
+	/*
+	 * hash 只在调度器中使用, 在 request 进入 dispatch 列表之后就会废除 
+	 * ipi_list 用于将 request 加入软中断完成队列
+	 * 这发生在 request 已经在 hash 中移除之后
+	 */
+	union {
+		struct hlist_node hash;	/* merge hash */
+		struct llist_node ipi_list;
+	};
+
+	
+ /*
+  * rb_node 仅用于 io scheduler 内部，当 request 被移到 dispatch 队列时就会被移除。
+  * special_vec 只有在设置了 RQF_SPECIAL_PAYLOAD 时才能使用，而且带有该标志的 request
+  * 不能被插入到 IO 调度器中。
+  */
+	union {
+		struct rb_node rb_node;	// 将 request 加入红黑树结构，用于调度排序查找
+		struct bio_vec special_vec; // 特殊 payload 时使用
+	};
+
+	/*
+	 * 预留三个指针给 io_schedular 使用, 如果需要更多需要动态分配使用
+	 */
+	struct {
+		struct io_cq		*icq;
+		void			*priv[2];
+	} elv;
+
+    // flush 请求相关的数据，保存原本的 end_io 回调和序号
+	struct {
+		unsigned int		seq;
+		rq_end_io_fn		*saved_end_io;
+	} flush;
+
+	u64 fifo_time;
+
+	/*
+	 * 完成回调
+	 */
+	rq_end_io_fn *end_io;
+	void *end_io_data;
+};
+```
+
+### 1.4 request 提交过程
+
+#### 1.4.1 `blk_mq_submit_bio`
+
+这个函数负责创建并把`request`请求发送到对应块设备上。函数会根据`q`和`bio`构建`struct request`结构体。但是符合以下条件的`request`可能不会被直接放入硬件队列中：
+
+- 该`request`可以与其它请求合并；
+- 希望把`request`放到`plug`队列，以便未来合并；
+- 队列上启用 IO 调度器。
+
+这里有几个概念：
+
+- **plug queue**：`blk_plug`是一个进程私有的临时请求缓冲区，收集短时间内的私有请求，一起发送给设备，提高合并和吞吐效率。注意，进入这个队列的`request`没有进入硬件队列；
+- **请求合并**：由程序局部性原理可知，块设备访问容易出现聚焦性。为了把寻址区域相同的请求一同发送给 IO 设备，将这些相近请求合并可以提高 IO 读写效率，降低读写次数；
+- **IO scheduler**：硬件挂载了 IO 调度器，就可能被排序、合并之后进入硬件队列；
+- **blk_mq**：块设备多队列，支持多核并发，每个 CPU 由各自的硬件队列。
+
+```c
+void blk_mq_submit_bio(struct bio *bio)
+{
+	struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+	struct blk_plug *plug = current->plug;
+	const int is_sync = op_is_sync(bio->bi_opf);
+	unsigned int integrity_action;
+	struct blk_mq_hw_ctx *hctx;
+	unsigned int nr_segs; // 当前处理的 bio 所需的物理数据段数量
+	struct request *rq; // 用于复用或者新建的 request 指针
+	blk_status_t ret;
+
+	// plug->cached_rqs 中可能有缓存请求，尝试取出来一个查看是否有缓存
+	rq = blk_mq_get_cached_request(plug, q, bio->bi_opf);
+
+
+    // 为之前被 zone 写入机制暂存、现在被放行并重新提交的 bio准备的快捷路径
+    // 这个 bio 已经实现了检测和拆分，可以被直接送去 request
+	if (bio_zone_write_plugging(bio)) {
+		nr_segs = bio->__bi_nr_segments;
+		if (rq) // 如果缓存里有 rq，就归还一个队列使用引用
+			blk_queue_exit(q);
+		goto new_request;
+	}
+
+
+    // 拿到缓存 rq，持有队列使用计数，没有拿到时，需要
+	if (!rq) {
+		if (unlikely(bio_queue_enter(bio)))
+			return;
+	}
+
+	/*
+	 * Device reconfiguration may change logical block size or reduce the
+	 * number of poll queues, so the checks for alignment and poll support
+	 * have to be done with queue usage counter held.
+	 */
+    // 检查 bio 是否满足要求，必要时需要拆分
+    // 检查起始位置和长度是否满足设备逻辑块大小的对齐要求
+	if (unlikely(bio_unaligned(bio, q))) { 
+		bio_io_error(bio);
+		goto queue_exit;
+	}
+
+    // 如果块设备不支持轮询查询，但是 bio 要求支持，就报错不支持
+	if ((bio->bi_opf & REQ_POLLED) && !blk_mq_can_poll(q)) {
+		bio_endio_status(bio, BLK_STS_NOTSUPP);
+		goto queue_exit;
+	}
+
+    // 
+	bio = __bio_split_to_limits(bio, &q->limits, &nr_segs);
+	if (!bio)
+		goto queue_exit;
+
+	integrity_action = bio_integrity_action(bio);
+	if (integrity_action)
+		bio_integrity_prep(bio, integrity_action);
+
+	blk_mq_bio_issue_init(q, bio);
+	if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
+		goto queue_exit;
+
+	if (bio_needs_zone_write_plugging(bio)) {
+		if (blk_zone_plug_bio(bio, nr_segs))
+			goto queue_exit;
+	}
+
+new_request:
+	if (rq) {
+		rq_qos_throttle(rq->q, bio);
+		rq->cmd_flags = bio->bi_opf;
+		INIT_LIST_HEAD(&rq->queuelist);
+		blk_mq_rq_late_init(rq, blk_time_get_ns());
+	} else {
+		rq = blk_mq_get_new_requests(q, plug, bio);
+		if (unlikely(!rq)) {
+			if (bio->bi_opf & REQ_NOWAIT)
+				bio_wouldblock_error(bio);
+			goto queue_exit;
+		}
+	}
+
+	trace_block_getrq(bio);
+
+	rq_qos_track(q, rq, bio);
+
+	blk_mq_bio_to_request(rq, bio, nr_segs);
+
+	ret = blk_crypto_rq_get_keyslot(rq);
+	if (ret != BLK_STS_OK) {
+		bio_endio_status(bio, ret);
+		blk_mq_free_request(rq);
+		return;
+	}
+
+	if (bio_zone_write_plugging(bio))
+		blk_zone_write_plug_init_request(rq);
+
+	if (op_is_flush(bio->bi_opf) && blk_insert_flush(rq))
+		return;
+
+	if (plug) {
+		blk_add_rq_to_plug(plug, rq);
+		return;
+	}
+
+	hctx = rq->mq_hctx;
+	if ((rq->rq_flags & RQF_USE_SCHED) ||
+	    (hctx->dispatch_busy && (q->nr_hw_queues == 1 || !is_sync))) {
+		blk_mq_insert_request(rq, 0);
+		blk_mq_run_hw_queue(hctx, true);
+	} else {
+		blk_mq_run_dispatch_ops(q, blk_mq_try_issue_directly(hctx, rq));
+	}
+	return;
+
+queue_exit:
+	if (!rq)
+		blk_queue_exit(q);
+	else
+		rq_list_add_head(&plug->cached_rqs, rq);
+}
+```
 
