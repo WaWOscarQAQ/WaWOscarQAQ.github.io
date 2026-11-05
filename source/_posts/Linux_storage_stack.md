@@ -754,6 +754,7 @@ struct request {
 - **请求合并**：由程序局部性原理可知，块设备访问容易出现聚焦性。为了把寻址区域相同的请求一同发送给 IO 设备，将这些相近请求合并可以提高 IO 读写效率，降低读写次数；
 - **IO scheduler**：硬件挂载了 IO 调度器，就可能被排序、合并之后进入硬件队列；
 - **blk_mq**：块设备多队列，支持多核并发，每个 CPU 由各自的硬件队列。
+- **zone 写入管理**：负责维持提交顺序，保证提交的写入请求能够按照顺序合理实现。
 
 ```c
 void blk_mq_submit_bio(struct bio *bio)
@@ -805,31 +806,39 @@ void blk_mq_submit_bio(struct bio *bio)
 		goto queue_exit;
 	}
 
-    // 
+    // 检查是否超出限制，如果超出大小限制就进行 bio 分块
 	bio = __bio_split_to_limits(bio, &q->limits, &nr_segs);
-	if (!bio)
+	if (!bio) 
 		goto queue_exit;
 
 	integrity_action = bio_integrity_action(bio);
-	if (integrity_action)
+	if (integrity_action) // 数据完整性扩展准备
 		bio_integrity_prep(bio, integrity_action);
 
-	blk_mq_bio_issue_init(q, bio);
+    // 按需记录 bio 的提交时间，供 cgroup I/O 延迟统计和控制使用
+	blk_mq_bio_issue_init(q, bio); 
+	// 能与已有请求进行合并就合并
 	if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
 		goto queue_exit;
-
+    // zone 写入管理
 	if (bio_needs_zone_write_plugging(bio)) {
+	    // 检查实际目标 zone,并实现管理
 		if (blk_zone_plug_bio(bio, nr_segs))
 			goto queue_exit;
 	}
-
 new_request:
+    // 缓存中的请求
 	if (rq) {
+	    // 按照 IO QoS 限流处理请求
 		rq_qos_throttle(rq->q, bio);
+		// 复制读写类型和相关标志
 		rq->cmd_flags = bio->bi_opf;
+		// 初始化 list 的链表节点
 		INIT_LIST_HEAD(&rq->queuelist);
+		// 补齐实际使用时的时间记录、调度器相关状态
 		blk_mq_rq_late_init(rq, blk_time_get_ns());
-	} else {
+	} else { // 没有缓存中的请求，处理本次请求
+	    // 尝试获取新请求，如果失败报错
 		rq = blk_mq_get_new_requests(q, plug, bio);
 		if (unlikely(!rq)) {
 			if (bio->bi_opf & REQ_NOWAIT)
@@ -838,36 +847,49 @@ new_request:
 		}
 	}
 
+    /*
+     * 记录追踪信息，将 bio 挂在 request 上
+     */
 	trace_block_getrq(bio);
 
 	rq_qos_track(q, rq, bio);
 
 	blk_mq_bio_to_request(rq, bio, nr_segs);
-
+    // 准备把资源加密
+    // 如果请求需要设备的内联加密能力，
+    // 就为它获取或引用相应的密钥槽，供驱动后续使用；
+    // 普通请求直接成功。
 	ret = blk_crypto_rq_get_keyslot(rq);
+	// 如果状态不对，就直接释放请求，释放 bio
 	if (ret != BLK_STS_OK) {
 		bio_endio_status(bio, ret);
 		blk_mq_free_request(rq);
 		return;
 	}
-
+    // 有 zone 写入要求，进行相关初始化
 	if (bio_zone_write_plugging(bio))
 		blk_zone_write_plug_init_request(rq);
-
+    // 处理持久化请求
+    // blk_insert_flush 按照设备能力安排必要的缓存刷新和数据写入步骤
+    // 返回 true 时，说明该请求已经被流程控制结果或完成
 	if (op_is_flush(bio->bi_opf) && blk_insert_flush(rq))
 		return;
 
-	if (plug) {
+	if (plug) { // 有 plug 队列，就将 rq 先丢进队列中
 		blk_add_rq_to_plug(plug, rq);
 		return;
 	}
 
-	hctx = rq->mq_hctx;
+    // 在没有 plug 支持下，先选择直接排队
+	hctx = rq->mq_hctx; // rq 对应硬件上下文
+	// 先排队，再异步触发派发
+	// 这里的条件是：请求需要经过 IO 调度器，或者当前派发繁忙，设备只有一个硬件队列
+	// 或者 IO 块被判断为非同步类
 	if ((rq->rq_flags & RQF_USE_SCHED) ||
 	    (hctx->dispatch_busy && (q->nr_hw_queues == 1 || !is_sync))) {
 		blk_mq_insert_request(rq, 0);
 		blk_mq_run_hw_queue(hctx, true);
-	} else {
+	} else { // 其他情况，交给驱动，资源不足时会转入等待队列
 		blk_mq_run_dispatch_ops(q, blk_mq_try_issue_directly(hctx, rq));
 	}
 	return;
@@ -879,4 +901,3 @@ queue_exit:
 		rq_list_add_head(&plug->cached_rqs, rq);
 }
 ```
-
