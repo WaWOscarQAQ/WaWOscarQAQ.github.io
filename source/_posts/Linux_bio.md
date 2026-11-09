@@ -1,16 +1,13 @@
 ---
-title: Linux 存储栈
+title: Linux 块设备层 IO 请求
 date: 2026-11-02
 tags: [学习笔记, Linux Kernel, 存储栈]
-# Cover artwork by 陌芋marginal: https://www.pixiv.net/artworks/105115167 (Wallhaven vqpem5).
-thumbnail: /images/covers/linux-storage-stack.webp
-cover: /images/covers/linux-storage-stack.webp
-excerpt: 简单了解 Linux 存储栈的架构
+thumbnail: /images/covers/linux-bio.webp
+cover: /images/covers/linux-bio.webp
+excerpt: 简单了解通用块层——梳理 struct bio 和 struct request
 ---
 
-# Linux 存储栈
-
-## 1 Linux 块设备层 IO 请求
+# Linux 通用块层 IO 请求
 
 在用户空间发起读写请求时，如果 page cache 没有需要的数据，需要从存储介质中进行读取/写入。Linux 为了兼容各种各样的存储设备，同样抽象出了通用块层作为统一接口向上层文件系统或页缓存提供高效读写服务。
 
@@ -28,7 +25,7 @@ excerpt: 简单了解 Linux 存储栈的架构
 
 通用块层在`submit_bio`到`queue_rq`这段对话中，负责从`bio->request`的调度，极大提升了系统IO性能和硬件利用率
 
-### 1.1 `struct bio`
+## 1 `struct bio`
 
 是文件系统/页缓存/RAID/dm 到通用块层的IO请求描述，主要包括：
 
@@ -142,7 +139,7 @@ struct bio {
 
 ![](/images/contents/Linux_Kernel/bio_struct.png)
 
-#### 1.1.1 `bi_opf`
+### 1.1 `bi_opf`
 
 其中，具体的`bi_opf`中的可选值如下：其中低 8 位为操作类型，高 24 位为请求处理 flag
 
@@ -213,7 +210,7 @@ enum req_flag_bits {
 };
 ```
 
-#### 1.1.2 `bio_flags`
+### 1.2 `bio_flags`
 
 `bio_flags` 有如下几种：
 
@@ -251,7 +248,7 @@ enum {
 };
 ```
 
-#### 1.1.3 `bio_vec`与`bio_iter`
+### 1.3 `bio_vec`与`bio_iter`
 
 `bio_vec`和`bio_iter`分工明确：
 
@@ -296,7 +293,7 @@ struct bio_vec {
 };
 ```
 
-### 1.2 执行流程 `submit_bio`
+## 2 执行流程 `submit_bio`
 
 函数的功能是：将一个 bio IO 请求提交到对应的块设备上。这个函数首先完全初始化了`struct bio`结构体。这个结构体之后会被提交到被`bi_bdev`描述的指定设备上。本次请求的成功 / 失败状态，以及完成的通知，都会通过 `bio->bi_end_io ()` 回调函数以异步方式传递，在 `bi_end_io ()` 被调用之前，调用者【不得】修改或访问该 `bio`。
 
@@ -321,7 +318,7 @@ EXPORT_SYMBOL(submit_bio);
 - `task_io_account_read`记录系统读取或写入的扇区数，`PGPGIN`表示读取，`PGPGOUT`表示写入；
 - `task_io_account_read`表示在这次任务内读取的字节数，在启用`CONFIG_TASK_IO_ACCOUNTING`时生效。
 
-#### 1.2.1 `submit_bio_noacct`
+### 2.1 `submit_bio_noacct`
 
 这个函数主要实现提交 `bio` 请求的细节，同时不再统计相关参数。它是更底层的提交请求，只能被 stacking block drivers 用于将 IO 操作交给更底层的驱动。对于用户和文件系统，应该使用`submit_bio` 。
 
@@ -453,7 +450,7 @@ end_io:
 EXPORT_SYMBOL(submit_bio_noacct);
 ```
 
-#### 1.2.2 `submit_bio_noacct_nocheck`
+### 2.2 `submit_bio_noacct_nocheck`
 
 ```c
 void submit_bio_noacct_nocheck(struct bio *bio, bool split)
@@ -495,7 +492,7 @@ void submit_bio_noacct_nocheck(struct bio *bio, bool split)
 	 
 ```
 
-#### 1.2.3 `__submit_bio_noacct`
+### 2.3 `__submit_bio_noacct`
 
 ```c
 static void __submit_bio_noacct(struct bio *bio)
@@ -571,7 +568,7 @@ static void __submit_bio_noacct(struct bio *bio)
 
 ![](/images/contents/Linux_Kernel/submit_bio_noacct.png)
 
-#### 1.2.4 `submit_bio_noacct_mq`
+### 2.4 `submit_bio_noacct_mq`
 
 ```c
 static void __submit_bio_noacct_mq(struct bio *bio)
@@ -592,7 +589,7 @@ static void __submit_bio_noacct_mq(struct bio *bio)
 
 在 mq 下不需要递归提交，根本原因是每次加入待处理链表的 bio 属于同一个请求队列，不需要进行下层请求优先的跨层排序。
 
-#### 1.2.5 `__submit_bio`
+### 2.5 `__submit_bio`
 
 ```c
 static void __submit_bio(struct bio *bio)
@@ -617,7 +614,7 @@ static void __submit_bio(struct bio *bio)
 }
 ```
 
-### 1.3 `struct request`
+## 3 `struct request`
 
 ```c
 struct request {
@@ -738,9 +735,9 @@ struct request {
 };
 ```
 
-### 1.4 request 提交过程
+## 4 request 提交过程
 
-#### 1.4.1 `blk_mq_submit_bio`
+### 4.1 `blk_mq_submit_bio`
 
 这个函数负责创建并把`request`请求发送到对应块设备上。函数会根据`q`和`bio`构建`struct request`结构体。但是符合以下条件的`request`可能不会被直接放入硬件队列中：
 
@@ -806,7 +803,7 @@ void blk_mq_submit_bio(struct bio *bio)
 		goto queue_exit;
 	}
 
-    // 检查是否超出限制，如果超出大小限制就进行 bio 分块
+    // 如果超出大小限制就进行 bio 分块
 	bio = __bio_split_to_limits(bio, &q->limits, &nr_segs);
 	if (!bio) 
 		goto queue_exit;
@@ -900,4 +897,172 @@ queue_exit:
 	else
 		rq_list_add_head(&plug->cached_rqs, rq);
 }
+```
+
+对于一个经过内核检测的 `request`请求，首先检查对应块设备有无`plug`队列，如有有就放到队列中。在没有`plug`支持下，根据是否使用 I/O 调度器以及派发是否繁忙，选择先排队并触发派发，或者尝试直接将请求提交给块设备驱动。
+
+### 4.2 `blk_mq_try_issue_directly`
+
+这个函数在尝试将`request`请求直接提交到块设备驱动上：
+
+- 如果设备有足够资源处理这个请求，这个请求就被直接提交到设备上处理；
+
+- 如果设备资源不足，将块设备存放到`hctx->queue`上，在未来某个时刻可以继续尝试发送。在这个队列上的排队请求有着高优先级。
+
+```c
+static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+		struct request *rq)
+{
+	blk_status_t ret;
+
+    // 如果硬件队列暂停或者请求队列暂停派发请求就先放到 queue 中等待下次尝试
+	if (blk_mq_hctx_stopped(hctx) || blk_queue_quiesced(rq->q)) {
+		blk_mq_insert_request(rq, 0);
+		blk_mq_run_hw_queue(hctx, false);
+		return;
+	}
+	
+    // 如果请求需要经过 IO 调度器，或者 blk_mq 没有准备好 budget 和 tag
+    // 加入 hctx->queue
+	if ((rq->rq_flags & RQF_USE_SCHED) || !blk_mq_get_budget_and_tag(rq)) {
+		blk_mq_insert_request(rq, 0);
+		blk_mq_run_hw_queue(hctx, rq->cmd_flags & REQ_NOWAIT);
+		return;
+	}
+
+   
+	ret = __blk_mq_issue_directly(hctx, rq, true);
+	switch (ret) {
+	case BLK_STS_OK:
+		break;
+	// 一般资源不足, 比如 DMA、内存
+	case BLK_STS_RESOURCE:
+	// 设备特定资源不足
+	case BLK_STS_DEV_RESOURCE:
+	    // 绕过 I/O 调度器，把 rq 放到 hctx->dispatch 链表的尾部
+		blk_mq_request_bypass_insert(rq, 0);
+		// 尝试运行队列
+		blk_mq_run_hw_queue(hctx, false);
+		break;
+	default:
+		blk_mq_end_request(rq, ret);
+		break;
+	}
+}
+```
+
+这里需要注意以下两个队列：
+
+- `hctx->queue`：在调用驱动之前发现不能进行派发，就存入这个队列；
+
+- `hctx->dispatch`：在调用驱动之后发现不能派发，存入的队列。
+
+### 4.3 `__blk_mq_issue_directly`
+
+这个函数是在不考虑失败处理的情况下，对块设备进行直接请求。
+
+```c
+static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
+					    struct request *rq, bool last)
+{
+	struct request_queue *q = rq->q;
+	struct blk_mq_queue_data bd = {
+		.rq = rq,
+		.last = last,
+	};
+	blk_status_t ret;
+
+	/*
+	 * For OK queue, we are done. For error, caller may kill it.
+	 * Any other error (busy), just add it to our list as we
+	 * previously would have done.
+	 */
+	ret = q->mq_ops->queue_rq(hctx, &bd);
+	switch (ret) {
+	case BLK_STS_OK: // 如果 OK，更新设备繁忙程度
+		blk_mq_update_dispatch_busy(hctx, false);
+		break;
+	case BLK_STS_RESOURCE:
+	case BLK_STS_DEV_RESOURCE:
+		blk_mq_update_dispatch_busy(hctx, true); // 资源紧张
+		// 回退 req 状态
+		__blk_mq_requeue_request(rq);
+		break;
+	default:
+		blk_mq_update_dispatch_busy(hctx, false);
+		break;
+	}
+
+	return ret;
+}
+```
+
+这里在遇到不同的设备返回状态时：
+
+- 首先调用`blk_mq_update_dispatch_busy`更新设备繁忙程度；
+
+- 如果返回值是资源紧张，就调用`__blk_mq_requeue_request`回退请求状态。
+
+值得注意的是，对于`queue_rq`函数，是由具体的驱动实现的，我们这里就先不进一步讨论：
+
+```c
+struct blk_mq_ops {
+	/**
+	 * @queue_rq: Queue a new request from block IO.
+	 */
+	blk_status_t (*queue_rq)(struct blk_mq_hw_ctx *,
+				 const struct blk_mq_queue_data *);
+	......
+}
+```
+
+### 4.4 `blk_mq_run_hw_queue`
+
+这个函数是运行硬件队列的流程：
+
+- 首先，检查 `hctx` 所属的请求队列是否未处于暂停派发状态，并且是否存在等待派发的请求；
+
+- 满足条件就启动该`hctx`对应的派发流程，尝试将请求给驱动，进而提交到硬件。
+
+```c
+void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
+{
+	bool need_run;
+
+	/*
+	 * 如果调用者标记允许直接执行，但处于中断过程中
+	 */
+	WARN_ON_ONCE(!async && in_interrupt());
+
+    // 标注后续可能睡眠的情况
+    // 如果支持直接执行，并且硬件上下文有后续可能面临 blk_mq 派发请求有被阻塞的情况
+	might_sleep_if(!async && hctx->flags & BLK_MQ_F_BLOCKING);
+
+    // 检查请求队列是否停止派发，hctx 是否有等待派发的请求
+	need_run = blk_mq_hw_queue_need_run(hctx);
+	if (!need_run) {
+		unsigned long flags;
+        // 第一次认为不需要的时候，加锁再确认
+        // 加锁的作用是篇：为了防止在检查过程中其他 cpu 并发执行接触暂停的情况
+		spin_lock_irqsave(&hctx->queue->queue_lock, flags);
+		need_run = blk_mq_hw_queue_need_run(hctx);
+		spin_unlock_irqrestore(&hctx->queue->queue_lock, flags);
+
+		if (!need_run)
+			return;
+	}
+    // 这里两种情况：
+    // 异步执行
+    // hctx 的 cpumask 没有当前 CPU 
+    // 将这个请求交给工作队列，异步执行
+	if (async || !cpumask_test_cpu(raw_smp_processor_id(), hctx->cpumask)) {
+		blk_mq_delay_run_hw_queue(hctx, 0);
+		return;
+	}
+
+    // 上下文执行派发入口
+	blk_mq_run_dispatch_ops(hctx->queue,
+				blk_mq_sched_dispatch_requests(hctx));
+}
+EXPORT_SYMBOL(blk_mq_run_hw_queue);
 ```
