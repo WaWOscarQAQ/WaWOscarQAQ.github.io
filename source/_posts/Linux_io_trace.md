@@ -1,5 +1,5 @@
 ---
-title: Linux 块设备层 IO 请求
+title: Linux 读写 I/O 调用追踪
 date: 2026-11-09
 tags: [学习笔记, Linux Kernel, 存储栈, I/O]
 thumbnail: /images/covers/linux-bio.webp
@@ -50,3 +50,66 @@ size：4096 bytes；blocks：8
 ```
 
 ## 2 `read()`函数调用栈
+
+这里使用`trace-cmd`工具，追踪指令如下：
+
+```shell
+sudo trace-cmd record -o read_demo.dat \
+  -p function_graph -g vfs_read \
+  -e block:block_bio_queue \
+  -e block:block_rq_issue \
+  -e block:block_rq_complete \
+  -T \
+  dd if=./demo_4k.bin of=/dev/null \
+     bs=4096 count=1 iflag=direct status=none
+```
+
+指令的具体含义为：
+
+- `trace-cmd record`：启用采集；
+
+- `-p function_graph`：生成函数调用图；
+
+- `-g vfs_read`：记录起点为`vfs_read`函数；
+
+- `-e`：后面的格式为`[子系统:事件名称]`，就是直接记录调用的事件；
+
+- `-T`：额外记录当时的事件调用栈。
+
+之后对记录结果进行查看：
+
+```shell
+sudo trace-cmd report -i read_demo.dat
+```
+
+发现内容过多，于是使用 AI 工具进行了一下过滤：
+
+```cpp
+vfs_read() {
+  ext4_file_read_iter() {
+    iomap_dio_rw() {
+      __iomap_dio_rw() {
+            iomap_dio_submit_bio() {
+              submit_bio() {
+                submit_bio_noacct() {
+                  submit_bio_noacct_nocheck() {
+                    __submit_bio() {
+                      blk_mq_submit_bio() {
+        blk_finish_plug() {
+          __blk_flush_plug() {
+            blk_mq_flush_plug_list() {
+                blk_mq_run_hw_queue() {
+                  blk_mq_sched_dispatch_requests() {
+                    __blk_mq_sched_dispatch_requests() {
+                        blk_mq_dispatch_rq_list() {
+                          scsi_queue_rq() {
+                            blk_mq_start_request() {
+                            scsi_dispatch_cmd() {
+                              ata_scsi_queuecmd() {
+                                  ata_scsi_translate() {
+                                    ata_qc_issue() {
+                                      ahci_qc_prep() {
+                                      ahci_qc_issue(); (ret=0x0)
+      iomap_dio_complete() {
+} (ret=0x1000)
+```

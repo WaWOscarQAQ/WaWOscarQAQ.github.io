@@ -1066,3 +1066,139 @@ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
 }
 EXPORT_SYMBOL(blk_mq_run_hw_queue);
 ```
+
+## 5 `plug` 队列流程
+
+### 5.1 初始化`plug`
+
+`plug`队列在`submit_bio`之前，其中初始化函数为`blk_start_plug`，被`__iomap_dio_rw`调用，一个函数调用的上下文路径为：
+
+> `__iomap_dio_rw`负责组织一次文件的 Direct I/O：把文件范围和用户缓冲区转换成 bio 提交，并管理等待、错误和完成状态。
+
+```c
+vfs_read()
+  → ext4_file_read_iter()
+    → iomap_dio_rw()
+      → __iomap_dio_rw()
+```
+
+其中具体函数很简单：
+
+```c
+void blk_start_plug(struct blk_plug *plug)
+{
+	blk_start_plug_nr_ios(plug, 1);
+}
+EXPORT_SYMBOL(blk_start_plug);
+```
+
+其中`blk_start_plug_nr_ios()`为：
+
+```c
+void blk_start_plug_nr_ios(struct blk_plug *plug, unsigned short nr_ios)
+{
+	struct task_struct *tsk = current;
+
+	/*
+	 * If this is a nested plug, don't actually assign it.
+	 */
+	if (tsk->plug)
+		return;
+
+	plug->cur_ktime = 0;
+	rq_list_init(&plug->mq_list);
+	rq_list_init(&plug->cached_rqs);
+	plug->nr_ios = min_t(unsigned short, nr_ios, BLK_MAX_REQUEST_COUNT);
+	plug->rq_count = 0;
+	plug->multiple_queues = false;
+	plug->has_elevator = false;
+	INIT_LIST_HEAD(&plug->cb_list);
+
+	/*
+	 * Store ordering should not be needed here, since a potential
+	 * preempt will imply a full memory barrier
+	 */
+	tsk->plug = plug;
+}
+```
+
+这里的核心机制为：`current`为当前线程的`struct task`，如果当前`tsk`有`plug`，不需要准备，如果没有，就初始化一个`plug`，之后挂载到`tsk`上。根据上述代码，我们可以得出结论：一个线程对应一个`plug`。
+
+### 5.2 `blk_add_rq_to_plug`
+
+函数主要负责将对应的`request`放到`plug`队列中，在`blk_mq_submit_bio`中调用。
+
+```c
+static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
+{
+    // 查看链表中的一个请求
+	struct request *last = rq_list_peek(&plug->mq_list);
+    // 没有缓存请求，记录 rq 事件
+	if (!plug->rq_count) {
+		trace_block_plug(rq->q);
+	} else if (plug->rq_count >= blk_plug_max_rq_count(plug) ||
+		   (!blk_queue_nomerges(rq->q) &&
+		    blk_rq_bytes(last) >= BLK_PLUG_FLUSH_SIZE)) {
+		// 如果 rq_count 比最大值大
+        // 或队列未禁止合并，且已有头部请求大小达到提前刷新阈值
+		blk_mq_flush_plug_list(plug, false);
+		last = NULL;
+		trace_block_plug(rq->q);
+	}
+
+    // 如果所有当前没有设置多队列支持
+    // 而且最后一个队列的请求和当前队列请求不同
+	if (!plug->multiple_queues && last && last->q != rq->q)
+		plug->multiple_queues = true;
+    // plug还没标记包含使用调度器标签的请求
+    // 当前rq正好使用了调度器标签，就把这个情况记下来
+	if (!plug->has_elevator && (rq->rq_flags & RQF_SCHED_TAGS))
+		plug->has_elevator = true;
+	// 将最后的 plug 加入到 mq_list 队尾
+	rq_list_add_tail(&plug->mq_list, rq); 
+	plug->rq_count++; // 添加队列数
+}
+```
+
+### 5.3 `blk_finish_plug`
+
+这个函数作为一个 wrapper，在外层调用，首先确认 `plug`是否为当前`plug`，之后在内部调用`__blk_flush_plug`函数，并且将`current->plug`置空。
+
+```c
+void blk_finish_plug(struct blk_plug *plug)
+{
+	if (plug == current->plug) {
+		__blk_flush_plug(plug, false);
+		current->plug = NULL;
+	}
+}
+EXPORT_SYMBOL(blk_finish_plug);
+```
+
+### 5.4 `__blk_flush_plug`
+
+本函数为清理`plug`的真正函数：
+
+```c
+void __blk_flush_plug(struct blk_plug *plug, bool from_schedule)
+{
+    // 如果注册 flush 回调，就执行这些回调
+	if (!list_empty(&plug->cb_list)) 
+		flush_plug_callbacks(plug, from_schedule);
+	/* 将 mq_list 中暂存的 request 交给后续派发流程 */
+	blk_mq_flush_plug_list(plug, from_schedule);
+	/*
+	 * 无论本次刷新由什么原因触发，都清理剩余的备用 request，
+	 * 即使本次 unplug 是由任务调度触发的。
+	 * 这些备用 request 持有请求队列的引用。
+	 * 我们不希望已经阻塞的任务继续持有这些引用，
+	 * 从而妨碍队列的冻结或暂停派发操作。
+	 */
+	if (unlikely(!rq_list_empty(&plug->cached_rqs)))
+		blk_mq_free_plug_rqs(plug);
+
+	plug->cur_ktime = 0;
+	/* 清除当前任务的块层缓存时间戳标记 */
+	current->flags &= ~PF_BLOCK_TS;
+}
+```
