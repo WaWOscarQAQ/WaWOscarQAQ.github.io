@@ -2,8 +2,9 @@
 title: Linux 读写 I/O 调用追踪
 date: 2026-11-09
 tags: [学习笔记, Linux Kernel, 存储栈, I/O]
-thumbnail: /images/covers/linux-bio.webp
-cover: /images/covers/linux-bio.webp
+# Cover artwork by RIVER (artist): https://wallhaven.cc/w/y8ryxl
+thumbnail: /images/covers/linux-io-trace-thumbnail.webp
+cover: /images/covers/linux-io-trace.webp
 excerpt: 通过 trace-cmd 工具和 bdftrace, 进行读写I/O追踪
 ---
 
