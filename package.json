@@ -8,11 +8,11 @@
   "description": "Personal Hexo blog with the Redefine theme, published by GitHub Pages.",
   "scripts": {
     "build": "hexo clean && hexo generate",
-    "verify": "node tools/verify-site.mjs",
+    "verify": "node tools/verify-site.mjs && node tools/verify-math.mjs",
     "new": "hexo new"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12.0"
   },
   "dependencies": {
     "hexo": "7.3.0",
@@ -26,6 +26,8 @@
     "hexo-renderer-marked": "7.0.1",
     "hexo-renderer-stylus": "3.0.1",
     "hexo-theme-redefine": "2.9.0",
-    "hexo-wordcount": "6.0.1"
+    "hexo-wordcount": "6.0.1",
+    "katex": "0.18.10",
+    "marked-katex-extension": "5.1.13"
   }
 }
