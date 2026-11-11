@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import Hexo from 'hexo';
 
@@ -14,9 +14,9 @@ try {
   assert.equal((inline.match(/data-katex/g) || []).length, 1, 'Math stylesheet should be linked once');
   assert(!inline.includes('katex-display'), 'Inline math became a display block');
 
-  const source = readFileSync('source/_posts/md raid.md', 'utf8');
-  const formula = source.match(/^\$\$\n[\s\S]*?\n\$\$/m)?.[0];
-  assert(formula, 'RAID formula fixture is missing');
+  const formula = String.raw`$$
+\text{disk\_size} = (\text{当前设备起始逻辑扇区} / \text{chunk\_sectors}) \% \text{nb\_dev}
+$$`;
   const block = await render(formula);
   assert(block.includes('katex-display') && block.includes('<math'), 'Display math or accessible MathML is missing');
   assert(!block.includes('katex-error'), 'The existing Chinese RAID formula failed to render');
@@ -26,23 +26,27 @@ try {
   assert(!literals.includes('data-katex') && !literals.includes('class="katex'), 'Code or escaped currency was treated as math');
   assert(literals.includes('$a_b$') && literals.includes('$HOME'), 'Code content was changed');
 
-  const raidPath = 'public/2026/11/11/md raid/index.html';
-  const raid = readFileSync(raidPath, 'utf8');
-  const link = raid.match(/<link\b[^>]*href="([^"]+)"[^>]*data-katex[^>]*>/);
-  assert(link && raid.indexOf(link[0]) > raid.indexOf('id="swup"'), 'Math CSS must travel with the Swup content');
-  assert.equal((raid.match(/data-katex/g) || []).length, 1, 'Generated math page has duplicate stylesheets');
-  assert(!raid.includes('katex-error') && raid.includes('class="katex-display"'), 'Published RAID math is broken');
-  assert(!/<script[^>]*src=["'][^"']*(?:katex|mathjax)/i.test(raid), 'Math must not load a browser rendering script');
+  // Generated date paths depend on the build timezone; inspect every output page.
+  for (const page of readdirSync('public', { recursive: true }).filter(file => file.endsWith('.html'))) {
+    const html = readFileSync(join('public', page), 'utf8');
+    const hasMath = /<span class="katex(?:-display)?">/.test(html);
+    const links = Array.from(html.matchAll(/<link\b[^>]*href="([^"]+)"[^>]*data-katex[^>]*>/g));
+    assert.equal(links.length, hasMath ? 1 : 0, `${page}: math stylesheet must load once, only when needed`);
+    assert(!/<span class="katex-error"/.test(html), `${page}: formula failed to render`);
+    assert(!/<script[^>]*src=["'][^"']*(?:katex|mathjax)/i.test(html), `${page}: browser math script is unnecessary`);
+    if (hasMath) {
+      assert(html.indexOf(links[0][0]) > html.indexOf('id="swup"'), `${page}: math CSS must travel with Swup content`);
+    }
+  }
 
+  const link = block.match(/<link\b[^>]*href="([^"]+)"[^>]*data-katex[^>]*>/);
+  assert(link, 'Math stylesheet was not linked');
   const cssFile = join('public', decodeURIComponent(link[1].split(/[?#]/)[0]));
   assert(existsSync(cssFile), 'Local math stylesheet is missing');
   const css = readFileSync(cssFile, 'utf8');
   assert(css.includes('font-display:swap'), 'Math fonts must not block text display');
   for (const [, font] of css.matchAll(/url\((fonts\/[^)]+)\)/g)) {
     assert(existsSync(join(dirname(cssFile), font)), `Missing math font: ${font}`);
-  }
-  for (const page of ['index.html', '2025/02/26/hello-world/index.html', '2026/11/09/Linux_io_trace/index.html']) {
-    assert(!readFileSync(join('public', page), 'utf8').includes('data-katex'), `Non-math page loads math assets: ${page}`);
   }
   console.log('Verified inline/display math, Chinese and escaped LaTeX, code/currency, conditional local assets, and Swup support.');
 } finally {
