@@ -123,3 +123,4 @@ inject:
           }
         }
       </style>
+    - '<link rel="stylesheet" href="/css/article-headings.css">'

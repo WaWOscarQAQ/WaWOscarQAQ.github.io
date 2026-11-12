@@ -1,0 +1,42 @@
+/* Keep heading typography scoped to the article, including mixed Chinese and English. */
+.article-content.markdown-body :is(h1, h2, h3, h4, h5, h6):not(.not-markdown) {
+  font-family: "Geist Variable", "Noto Sans SC", -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-weight: 600;
+  font-style: normal;
+  line-height: 1.45;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+.article-content.markdown-body h1:not(.not-markdown) {
+  font-size: clamp(1.65em, calc(1.35em + 0.75vw), 2em);
+}
+
+.article-content.markdown-body h2:not(.not-markdown) {
+  font-size: clamp(1.4em, calc(1.15em + 0.6vw), 1.65em);
+}
+
+.article-content.markdown-body h3:not(.not-markdown) {
+  font-size: clamp(1.2em, calc(1.05em + 0.35vw), 1.35em);
+}
+
+.article-content.markdown-body h4:not(.not-markdown) {
+  font-size: 1.15em;
+}
+
+.article-content.markdown-body h5:not(.not-markdown) {
+  font-size: 1.05em;
+}
+
+.article-content.markdown-body h6:not(.not-markdown) {
+  font-size: 1em;
+}
+
+/* Preserve monospace identifiers while balancing them with the heading text. */
+.article-content.markdown-body :is(h1, h2, h3, h4, h5, h6):not(.not-markdown) code {
+  font-size: 0.88em;
+  font-weight: 500;
+  letter-spacing: normal;
+}
