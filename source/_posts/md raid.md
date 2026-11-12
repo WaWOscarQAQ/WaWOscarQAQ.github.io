@@ -81,11 +81,21 @@ struct r0conf {
 };
 ```
 
-注意`strip_zone`其实是一个指向数组首元素的指针，方便多`strip_zone`管理。
+- `strip_zone`其实是一个指向数组首元素的指针，方便多`strip_zone`管理；
+
+- `devlist`并不是简单的设备堆砌，而是按照`strip_zone`的顺序，将设备按照`chunk`切割之后的顺序进行排序：
+
+  - 设备A、B、C 的 chunks 数量分别为 2、2、1；
+
+  - 根据后文初始化条带的过程，`dev_list`大小为 `6 * sizeof(struct md_rdev*)`
+
+  - 这样`dev_list`就是：`[A, B, C, A, B, NULL]`；
+
+  - 其中`[A,B,C]`是条带区 1，`[A, B]` 是条带 2。
 
 ### 条带区初始化
 
-在函数`create_strip_zones`中，初步实现了条带的初始化：
+在函数`create_strip_zones`中，实现了条带的初始化：
 
 ```c
 static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
@@ -197,7 +207,7 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 	conf->strip_zone = kvzalloc_objs(struct strip_zone, conf->nr_strip_zones);
 	if (!conf->strip_zone)
 		goto abort;
-	// 
+	// 这里分配的实际大小是：设备指针 * 条带区 * 每个 zone 预留的槽位数量
 	conf->devlist = kvzalloc(array3_size(sizeof(struct md_rdev *),
 					     conf->nr_strip_zones,
 					     mddev->raid_disks),
@@ -205,77 +215,80 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 	if (!conf->devlist)
 		goto abort;
 
-	/* The first zone must contain all devices, so here we check that
-	 * there is a proper alignment of slots to devices and find them all
-	 */
+	// 第一个区域一定有所有的设备
 	zone = &conf->strip_zone[0];
 	cnt = 0;
-	smallest = NULL;
-	dev = conf->devlist;
+	smallest = NULL; // 获取所有设备中的虽小扇区
+	dev = conf->devlist; // devlist
 	err = -EINVAL;
 	rdev_for_each(rdev1, mddev) {
-		int j = rdev1->raid_disk;
+		int j = rdev1->raid_disk; // 设备在 raid 中的特殊编号
+		                          // 下面的 new_raid_disks 
+		                          // 是在阵列转换完成之后的新设备编号
 
-		if (mddev->level == 10) {
+		if (mddev->level == 10) { // 如果 level 是 raid10
 			/* taking over a raid10-n2 array */
-			j /= 2;
+			j /= 2; // 需要分半, 因为是由两个 raid1 组成的 raid0
 			rdev1->new_raid_disk = j;
 		}
 
-		if (mddev->level == 1) {
-			/* taiking over a raid1 array-
-			 * we have only one active disk
-			 */
+		if (mddev->level == 1) { // raid1 只有一个活跃盘
 			j = 0;
 			rdev1->new_raid_disk = j;
 		}
 
-		if (j < 0) {
+		if (j < 0) { // raid_disk = -1 通常表示没有分配活动成员槽位
 			pr_warn("md/raid0:%s: remove inactive devices before converting to RAID0\n",
 				mdname(mddev));
 			goto abort;
 		}
-		if (j >= mddev->raid_disks) {
+		if (j >= mddev->raid_disks) { // j 的值超过设备总数量
 			pr_warn("md/raid0:%s: bad disk number %d - aborting!\n",
 				mdname(mddev), j);
 			goto abort;
 		}
-		if (dev[j]) {
+		if (dev[j]) { // 如果这个位置被占用, 就报错
 			pr_warn("md/raid0:%s: multiple devices for %d - aborting!\n",
 				mdname(mddev), j);
 			goto abort;
 		}
-		dev[j] = rdev1;
+		dev[j] = rdev1; // 注意，这里针对的只是第一个 zone 的内容
+		                // 所以不会出现重复情况
 
 		if (!smallest || (rdev1->sectors < smallest->sectors))
-			smallest = rdev1;
+			smallest = rdev1; // 
 		cnt++;
 	}
-	if (cnt != mddev->raid_disks) {
+	if (cnt != mddev->raid_disks) { // 如果第一个区域的参与磁盘数<总磁盘数
 		pr_warn("md/raid0:%s: too few disks (%d of %d) - aborting!\n",
 			mdname(mddev), cnt, mddev->raid_disks);
 		goto abort;
 	}
-	zone->nb_dev = cnt;
-	zone->zone_end = smallest->sectors * cnt;
+	zone->nb_dev = cnt; // 记录阵列设备数量
+	zone->zone_end = smallest->sectors * cnt; // 这样第一个 zone 的结尾就是
+	                                          // 最小设备扇区数 * 设备数
 
 	curr_zone_end = zone->zone_end;
 
 	/* now do the other zones */
-	for (i = 1; i < conf->nr_strip_zones; i++)
+	for (i = 1; i < conf->nr_strip_zones; i++) // 对剩余的条带区进行构造
 	{
 		int j;
 
-		zone = conf->strip_zone + i;
-		dev = conf->devlist + i * mddev->raid_disks;
+		zone = conf->strip_zone + i; // 遍历到对应条带区
+		dev = conf->devlist + i * mddev->raid_disks; // 遍历到 dev_list的
+		                                             // 最新区域
 
 		pr_debug("md/raid0:%s: zone %d\n", mdname(mddev), i);
-		zone->dev_start = smallest->sectors;
-		smallest = NULL;
+		zone->dev_start = smallest->sectors; // 设备上真实开始的位置
+		                                     // 第二次是越过chunk的位置
+		smallest = NULL; // 注意，这里置空了 smallest !
 		c = 0;
 
-		for (j=0; j<cnt; j++) {
-			rdev = conf->devlist[j];
+		for (j=0; j<cnt; j++) { // 符号好混乱，cnt 代表设备数
+			rdev = conf->devlist[j]; 
+			// 如果设备的扇区总数比新条带开始的位置还要小，说明该设备已经
+			// 没有空间了，跳过
 			if (rdev->sectors <= zone->dev_start) {
 				pr_debug("md/raid0:%s: checking %pg ... nope\n",
 					 mdname(mddev),
@@ -286,22 +299,25 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 				 " contained as device %d\n",
 				 mdname(mddev),
 				 rdev->bdev, c);
-			dev[c] = rdev;
+			dev[c] = rdev; // 记住，这里是 disk_list 最新位置
 			c++;
 			if (!smallest || rdev->sectors < smallest->sectors) {
-				smallest = rdev;
+				smallest = rdev; // 这里统计的是剩余设备中最小的一个
+				                 // 之后偏移可以通过 smallest - start_sectors
+				                 // 实现
 				pr_debug("md/raid0:%s:  (%llu) is smallest!.\n",
 					 mdname(mddev),
 					 (unsigned long long)rdev->sectors);
 			}
 		}
 
-		zone->nb_dev = c;
-		sectors = (smallest->sectors - zone->dev_start) * c;
+		zone->nb_dev = c; // 记录总数
+		// 当前 zone 的实际总扇区数
+		sectors = (smallest->sectors - zone->dev_start) * c; 
 		pr_debug("md/raid0:%s: zone->nb_dev: %d, sectors: %llu\n",
 			 mdname(mddev),
 			 zone->nb_dev, (unsigned long long)sectors);
-
+		这里是逻辑扇区
 		curr_zone_end += sectors;
 		zone->zone_end = curr_zone_end;
 
@@ -309,16 +325,22 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 			 mdname(mddev),
 			 (unsigned long long)smallest->sectors);
 	}
-
+    // 条带数为 1，总设备数为 1，走初始布局
 	if (conf->nr_strip_zones == 1 || conf->strip_zone[1].nb_dev == 1) {
 		conf->layout = RAID0_ORIG_LAYOUT;
-	} else if (mddev->layout == RAID0_ORIG_LAYOUT ||
+	} 
+	// mddev 要求使用两种布局中的一种
+	else if (mddev->layout == RAID0_ORIG_LAYOUT ||
 		   mddev->layout == RAID0_ALT_MULTIZONE_LAYOUT) {
 		conf->layout = mddev->layout;
-	} else if (default_layout == RAID0_ORIG_LAYOUT ||
+	} 
+	// 否则查看默认布局是哪种
+	else if (default_layout == RAID0_ORIG_LAYOUT ||
 		   default_layout == RAID0_ALT_MULTIZONE_LAYOUT) {
 		conf->layout = default_layout;
-	} else {
+	} 
+	// 否则报错
+	else {
 		pr_err("md/raid0:%s: cannot assemble multi-zone RAID0 with default_layout setting\n",
 		       mdname(mddev));
 		pr_err("md/raid0: please set raid0.default_layout to 1 or 2\n");
@@ -326,13 +348,16 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 		goto abort;
 	}
 
+    // 如果是初始布局，从第二个扇区开始 disk_shift 应该为全局设备偏移
+    // 不需要对替代布局说明，因为替代布局每次就是从 0 开始
 	if (conf->layout == RAID0_ORIG_LAYOUT) {
 		for (i = 1; i < conf->nr_strip_zones; i++) {
 			sector_t first_sector = conf->strip_zone[i-1].zone_end;
-
+            // 每次用计算当前扇区是第几个 chunks
 			sector_div(first_sector, mddev->chunk_sectors);
 			zone = conf->strip_zone + i;
 			/* disk_shift is first disk index used in the zone */
+			// 使用全局 disk 偏移
 			zone->disk_shift = sector_div(first_sector,
 						      zone->nb_dev);
 		}
@@ -349,7 +374,182 @@ abort:
 	*private_conf = ERR_PTR(err);
 	return err;
 }
+```
 
+总结一下：
+
+- 首先根据不同的设备情况（是否是`dm`），对基础逻辑块大小进行获取。使用算法对条带区的数量进行了计算：
+
+  - 每有两个设备的实际扇区数量不同，就意味着多出一个条带区；
+
+- 对条带区结构体，raid0`disk_list`进行分配，这里注意`disk_list`定义；
+
+- 接下来，对条带区和`r0config`的数据进行初始化：
+
+  - 对第一个条带区进行规划（这个条带区必然包含所有设备），更新`disk_list`，和一些初始偏移数据；
+
+  - 之后对后续条带区进行初始化。
+
+- 最后设置 layout，如果是初始布局需要把偏移换成全局设备偏移，使用替代方案起始偏移就是 0（相对偏移）。
+
+### 由逻辑扇区找到对应条带区
+
+函数由`find_zone`实现：
+
+```c
+static struct strip_zone *find_zone(struct r0conf *conf,
+				    sector_t *sectorp)
+{
+	int i;
+	struct strip_zone *z = conf->strip_zone;
+	sector_t sector = *sectorp;
+
+	for (i = 0; i < conf->nr_strip_zones; i++)
+		if (sector < z[i].zone_end) {
+			if (i)
+				*sectorp = sector - z[i-1].zone_end;
+			return z + i;
+		}
+	BUG();
+}
+```
+
+逻辑很简单，因为每个`zone_end`记录的是这个块结束的逻辑扇区号，于是遍历`strip_zone`数组，只要`sector`小于该区域的最后逻辑扇区号，说明就在该条带区中。
+
+注意，这里最后修改了`sectorp`：将其修改为该条带区中的相对扇区偏移。最终返回条带区位置。
+
+### 确定 bio 请求对应的成员设备号和设备内相对偏移
+
+由`map_sector`实现，选择一个成员设备，计算请求在该设备当前 zone 内的扇区偏移：
+
+- `sector`在原始布局中是逻辑扇区号，在代替布局中是相对 zone 的扇区号；
+
+- `sector_offset`是指向本次请求的条带区内相对偏移量；
+
+- `mddev`：请求发往的 raid 阵列。
+
+```c
+static struct md_rdev *map_sector(struct mddev *mddev, 
+                                  struct strip_zone *zone,
+				                  sector_t sector, 
+				                  sector_t *sector_offset)
+{
+	unsigned int sect_in_chunk;
+	sector_t chunk;
+	struct r0conf *conf = mddev->private;
+	int raid_disks = conf->strip_zone[0].nb_dev; 
+	unsigned int chunk_sects = mddev->chunk_sectors;
+
+	if (is_power_of_2(chunk_sects)) { // 如果是 chunk 大小是 2 的倍数
+	                                  // 这里单独拿出来是为了利用位运算加速
+	    // find first zero 找到第一个 0 的位置
+	    // 一个2次幂形式的数，ffz 它的反应该是找到这个数的 1 的位置
+	    // 后面可以把这个变量视为 2^n 中的 n
+		int chunksect_bits = ffz(~chunk_sects); 
+		/* find the sector offset inside the chunk */
+		// 计算在 chunk 内的扇偏移
+		sect_in_chunk  = sector & (chunk_sects - 1);
+		sector >>= chunksect_bits; // 现在 sector 变成 chunk 偏移
+		/* chunk in zone */
+		chunk = *sector_offset; // 条带区内相对偏移量（单位扇区）
+		// 条带区内相对偏移量 / 扇区单位 = 条带区内哪个 chunk
+		// 条带区内哪个 chunk / 设备数 = 当前 chunk 落在一个zone的第几轮循环
+		sector_div(chunk, zone->nb_dev << chunksect_bits);
+	} else {
+	    // sector 变成逻辑 chunk 位置，sector_in_chunk 表示 chunk 内偏移
+		sect_in_chunk = sector_div(sector, chunk_sects);
+		// 获得条带区内的相对扇区偏移
+		chunk = *sector_offset;
+		// 当前 chunk 落在第几个循环中
+		sector_div(chunk, chunk_sects * zone->nb_dev);
+	}
+	/*
+	*  position the bio over the real device
+	*  real sector = chunk in device + starting of zone
+	*	+ the position in the chunk
+	*/
+
+    // 在第几轮循环（在一个设备上的第几个 chunk） * chunk_sect + 扇区内偏移 
+    // = 在一个设备上的相对扇区偏移
+	*sector_offset = (chunk * chunk_sects) + sect_in_chunk;
+	// zone 偏移 * dev_list固定设备槽
+	// 逻辑 chunk 位置 % 条带区设备数 得到的是当前 chunk 应该被交给的设备
+	// 得到实际设备位置
+	return conf->devlist[(zone - conf->strip_zone)*raid_disks
+			     + sector_div(sector, zone->nb_dev)];
+}
+```
+
+函数的根本目的是根据【逻辑扇区号】和【条带区的相对扇区偏移】，在对应 md 设备的 raid 阵列上找到`dev_list`上的设备：
+
+- 首先计算了逻辑 chunk 偏移和 chunk 内扇区偏移：
+
+  $\text{chunk\_idx} = \text{sector} \div \text{chunk\_size}$
+
+  $\text{sect\_in\_chunk} \equiv \text{sector} \mod{  \text{chunk\_size}}$    
+
+- 计算当前 chunk 落在第几轮设备循环，也就是落在对应设备的第几个 chunk 上：
+
+  $\text{chunk} = \text{sector\_offset} \div  \text{nb\_dev} \div \text{chunk\_size}$
+
+- 重新计算在一个设备上的相对扇区偏移：
+
+  $\text{sector\_offset} = (\text{chunk} * \text{chunk\_sects}) + \text{sect\_in\_chunk}$   
+
+- 计算在`dev_list`上的相对偏移：
+
+  $\text{zone\_idx} * \text{raid\_disks} + \text{chunk\_idx} \% \text{nb\_dev}$
+
+这里进行了 `chunk_size`是否为 2 次幂形式的判断，意图在使用位运算加速，这样可以更快的获得逻辑 chunk 偏移和 chunk 内的扇区偏移。
+
+> 在代替布局下，这个 chunk_idx 是对应 zone 的 chunk 偏移，也就对应后面的chunk_idx % nb_dev 其实是在 zone 内对应到那个设备上。
+>
+> 这里完全符合我们前面提到的原则，一个是全局，一个是相对 zone
+
+### 在 raid0 情景下的 submit_bio 方式
+
+
+
+```c
+static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
+{
+	struct r0conf *conf = mddev->private;
+	struct strip_zone *zone;
+	struct md_rdev *tmp_dev;
+	sector_t bio_sector = bio->bi_iter.bi_sector;
+	sector_t sector = bio_sector; 
+
+	md_account_bio(mddev, &bio);
+    // 传入的 sector 是逻辑扇区，输出的 sector 是相对一个 zone 的扇区偏移
+	zone = find_zone(mddev->private, &sector);
+	switch (conf->layout) {
+	case RAID0_ORIG_LAYOUT:
+	    // 在传统布局下，输入的是逻辑扇区偏移，流程就和我们说的没什么区别
+		tmp_dev = map_sector(mddev, zone, bio_sector, &sector);
+		break;
+	case RAID0_ALT_MULTIZONE_LAYOUT:
+	    // 在当前布局下，我们传入的是相对 zone 的逻辑扇区偏移
+		tmp_dev = map_sector(mddev, zone, sector, &sector);
+		break;
+	default:
+		WARN(1, "md/raid0:%s: Invalid layout\n", mdname(mddev));
+		bio_io_error(bio);
+		return;
+	}
+
+	if (unlikely(is_rdev_broken(tmp_dev))) {
+		bio_io_error(bio);
+		md_error(mddev, tmp_dev);
+		return;
+	}
+
+	bio_set_dev(bio, tmp_dev->bdev);
+	bio->bi_iter.bi_sector = sector + zone->dev_start +
+		tmp_dev->data_offset;
+	mddev_trace_remap(mddev, bio, bio_sector); // toDo
+	mddev_check_write_zeroes(mddev, bio); // toDo
+	submit_bio_noacct(bio);
+}
 ```
 
 
