@@ -1,22 +1,18 @@
 ---
-title: MD RAID
+title: MD RAID0
 date: 2026-11-11
 tags: [学习笔记, Linux Kernel, 存储栈, RAID]
 # Cover artwork by Ya ju: https://wallhaven.cc/w/9m2mo1
 thumbnail: /images/covers/md-raid-thumbnail.webp
 cover: /images/covers/md-raid.webp
-excerpt: Linux MD 软件 RAID 机制。
+excerpt: Linux MD 软件 RAID0 简介
 ---
 
-# MD raid
-
-MD raid 又称为软件 raid，中文名称为多设备磁盘阵列。是基于软件实现的对磁盘的逻辑阵列拼接，使其行为符合 raid 实现。
-
-## raid0
+# RAID0
 
 raid0 又称为条带化存储，将输入的数据按照块分开，分布式存储在不同磁盘上，具有很高的存储效率。raid0 不对存储数据有任何安全性保证，没有备份恢复功能，因此不适合安全性要求高的存储场景。
 
-### strip_zone
+## strip_zone
 
 条带区（`strip_zone`）结构体定义在`drivers/md/raid0.h`中：
 
@@ -45,7 +41,7 @@ $$
 
 - `strip_zone_2`由`A_chunks[3:]`、`B_chunks[3:]`构成。
 
-### r0layout
+## r0layout
 
 这是一个枚举体，在`struct strip_zone`同一文件下：
 
@@ -68,7 +64,7 @@ enum r0layout {
 
 - 对于`RAID0_ALT_MULTIZONE_LAYOUT`版本，我们应该使用 0 作为起始位置；
 
-### r0conf
+## r0conf
 
 这里是对 raid0 各项参数的集成：
 
@@ -93,7 +89,7 @@ struct r0conf {
 
   - 其中`[A,B,C]`是条带区 1，`[A, B]` 是条带 2。
 
-### 条带区初始化
+## 条带区初始化
 
 在函数`create_strip_zones`中，实现了条带的初始化：
 
@@ -392,7 +388,7 @@ abort:
 
 - 最后设置 layout，如果是初始布局需要把偏移换成全局设备偏移，使用替代方案起始偏移就是 0（相对偏移）。
 
-### 由逻辑扇区找到对应条带区
+## 由逻辑扇区找到对应条带区
 
 函数由`find_zone`实现：
 
@@ -418,7 +414,7 @@ static struct strip_zone *find_zone(struct r0conf *conf,
 
 注意，这里最后修改了`sectorp`：将其修改为该条带区中的相对扇区偏移。最终返回条带区位置。
 
-### 确定 bio 请求对应的成员设备号和设备内相对偏移
+## 确定 bio 请求对应的成员设备号和设备内相对偏移
 
 由`map_sector`实现，选择一个成员设备，计算请求在该设备当前 zone 内的扇区偏移：
 
@@ -506,9 +502,7 @@ static struct md_rdev *map_sector(struct mddev *mddev,
 >
 > 这里完全符合我们前面提到的原则，一个是全局，一个是相对 zone
 
-### 在 raid0 情景下的 submit_bio 方式
-
-
+## 在 raid0 情景下的 submit_bio 方式
 
 ```c
 static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
@@ -519,6 +513,7 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
 	sector_t bio_sector = bio->bi_iter.bi_sector;
 	sector_t sector = bio_sector; 
 
+    // 拷贝 bio
 	md_account_bio(mddev, &bio);
     // 传入的 sector 是逻辑扇区，输出的 sector 是相对一个 zone 的扇区偏移
 	zone = find_zone(mddev->private, &sector);
@@ -537,13 +532,16 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
 		return;
 	}
 
-	if (unlikely(is_rdev_broken(tmp_dev))) {
+	if (unlikely(is_rdev_broken(tmp_dev))) { // 设备不再有效
 		bio_io_error(bio);
 		md_error(mddev, tmp_dev);
 		return;
 	}
 
 	bio_set_dev(bio, tmp_dev->bdev);
+	// data_offset 设备上数据起始点
+	// dev_start 数据区条带的起始偏移
+	// 条带在设备数据区的偏移 
 	bio->bi_iter.bi_sector = sector + zone->dev_start +
 		tmp_dev->data_offset;
 	mddev_trace_remap(mddev, bio, bio_sector); // toDo
@@ -552,4 +550,210 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
 }
 ```
 
+这个函数的整体流程是：对原始的 bio 请求进行拷贝，之后通过 `bio_sector`找到对应的`stripe_zone`以及在一个 zone 内的相对扇区偏移。
 
+根据布局方式的不同，传入找到的 zone、逻辑偏移以及一个 zone 内的相对偏移，找到对应设备在`dev_list`中的位置以及在设备中的相对扇区偏移。将 bio 的设备替换为`tmp_dev->bdev`，同时将`bi_sector`设置为设备数据起始点 + 数据区上条带的起始偏移 + 条带在设备数据区的偏移。
+
+函数`mddev_trace_remap()`内部通过宏定义的方式实现，记录了 md raid 在映射前后的扇区变化：请求的逻辑扇区$\rightarrow$在设备上的相对扇区偏移。
+
+`mddev_check_write_zeroes`函数的逻辑是，如果 bio 请求对应的实际设备不支持写零请求，就将整个 `mddev`对应的虚拟设备（`gendisk`）的写零能力禁掉。
+
+```c
+static inline void mddev_check_write_zeroes(struct mddev *mddev, 
+                                            struct bio *bio)
+{
+	if (bio_op(bio) == REQ_OP_WRITE_ZEROES &&
+	    !bio->bi_bdev->bd_disk->queue->limits.max_write_zeroes_sectors)
+		mddev->gendisk->queue->limits.max_write_zeroes_sectors = 0;
+}
+```
+
+总结一下，在 md raid0 视角下的 `submit_bio`，就是把`bio`请求的逻辑扇区偏移映射到阵列的实际设备的具体偏移上。本质上，相当于`mddev`实现请求从虚拟设备地址到实际块设备地址的映射。
+
+#### 外层包装函数`raid0_make_request`
+
+主要实现了在提交 bio 请求的前置检查，并在最后调用`raid0_map_submit_bio`：
+
+```c
+static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
+{
+	sector_t sector;
+	unsigned chunk_sects;
+	unsigned sectors;
+
+	if (unlikely(bio->bi_opf & REQ_PREFLUSH)
+	    && md_flush_request(mddev, bio))
+		return true;
+
+    // 用来通知设备：某段范围的数据不再需要。
+	if (unlikely((bio_op(bio) == REQ_OP_DISCARD))) {
+		raid0_handle_discard(mddev, bio);
+		return true;
+	}
+
+	sector = bio->bi_iter.bi_sector;
+	chunk_sects = mddev->chunk_sectors;
+
+    // 和之前代码很相似
+    // 对 2 次幂进行取余加速
+    // 记录 bio 请求落在的 chunk 还有多少空余位置
+    // 右侧是 sectors 的意义
+    // |        | sectors |
+    // --------------------
+	sectors = chunk_sects -
+		(likely(is_power_of_2(chunk_sects))
+		 ? (sector & (chunk_sects-1))
+		 : sector_div(sector, chunk_sects));
+    // 如果 chunk 剩余位置比 bio 请求大小还要小（扇区数）
+    // 对 bio 进行分割
+	if (sectors < bio_sectors(bio)) {
+		bio = bio_submit_split_bioset(bio, sectors,
+					      &mddev->bio_set);
+		if (!bio)
+			return true;
+	}
+
+	raid0_map_submit_bio(mddev, bio);
+	return true;
+}
+```
+
+注意这个函数返回`true`表示`bio`已经被接管或者处理了。
+
+### `raid0_handle_discard`
+
+```c
+static void raid0_handle_discard(struct mddev *mddev, struct bio *bio)
+{
+	struct r0conf *conf = mddev->private;
+	struct strip_zone *zone;
+	sector_t start = bio->bi_iter.bi_sector;
+	sector_t end;
+	unsigned int stripe_size;
+	sector_t first_stripe_index, last_stripe_index;
+	sector_t start_disk_offset;
+	unsigned int start_disk_index;
+	sector_t end_disk_offset;
+	unsigned int end_disk_index;
+	unsigned int disk;
+	sector_t orig_start, orig_end;
+
+    // orig_start 是全局扇区偏移
+	orig_start = start;
+	// start 是相对 zone 的扇区偏移
+	zone = find_zone(conf, &start);
+
+    // 记录 bio 请求的最后一个扇区，如果 bio 请求大小超过 chunk
+    // 先切割再计算
+    // orig_end 记录该数据
+	if (bio_end_sector(bio) > zone->zone_end) {
+		bio = bio_submit_split_bioset(bio,
+				zone->zone_end - bio->bi_iter.bi_sector,
+				&mddev->bio_set);
+		if (!bio)
+			return;
+
+		end = zone->zone_end;
+	} else {
+		end = bio_end_sector(bio);
+	}
+    
+    orig_end 是全局扇区偏移
+	orig_end = end;
+	// end 记录 bio 结束位置相对条带区的偏移
+	if (zone != conf->strip_zone)
+		end = end - zone[-1].zone_end;
+
+	/* Now start and end is the offset in zone */
+	// 一条的大小 = 设备数 * 一个 chunk 的扇区数
+	stripe_size = zone->nb_dev * mddev->chunk_sectors;
+
+	first_stripe_index = start;
+	// 计算这个 bio 的第一条 index
+	sector_div(first_stripe_index, stripe_size);
+	last_stripe_index = end;
+	// bio 最后一条的索引
+	sector_div(last_stripe_index, stripe_size);
+
+	/* In the first zone the original and alternate layouts are the same */
+	if ((conf->layout == RAID0_ORIG_LAYOUT) && (zone != conf->strip_zone)) {
+	    // origin_start 变成了全局起始逻辑 chunk 偏移
+		sector_div(orig_start, mddev->chunk_sectors);
+		// 全局起始逻辑 chunk 偏移 % zone 内 dev 偏移 = 落在一个条带的第几号设备上
+		start_disk_index = sector_div(orig_start, zone->nb_dev);
+		// 实际上计算的是 [start_disk_index + (nb_dev - disk_shift)] % nb_dev
+		start_disk_index = map_disk_shift(start_disk_index,
+						  zone->nb_dev,
+						  zone->disk_shift);
+		sector_div(orig_end, mddev->chunk_sectors);
+		end_disk_index = sector_div(orig_end, zone->nb_dev);
+		end_disk_index = map_disk_shift(end_disk_index,
+						zone->nb_dev, zone->disk_shift);
+	} else {
+	    // 开始设备的 index 是 （开始扇区号 - 开始条 * 条大小）/ chunk 大小
+	    // 在替代模式下，一个条上的第几个 chunk 就是对应的设备号
+		start_disk_index = (int)(start - first_stripe_index * stripe_size) / /
+			mddev->chunk_sectors;
+		// 开始设备的 index 是 （结束扇区号 - 开始条 * 条大小）/ chunk 大小
+		end_disk_index = (int)(end - last_stripe_index * stripe_size) /
+			mddev->chunk_sectors;
+	}
+	// (start - first_stripe_index * stripe_size) % chunk_sectors
+	// 表示起始位置距离 chunks 有多远
+	// first_stripe_index * mddev->chunk_sectors
+	// 条带的 index -> 设备上第几块 chunk，于是表示在设备上的 chunk 的起始扇区偏移 
+	start_disk_offset = ((int)(start - first_stripe_index * stripe_size) %
+		mddev->chunk_sectors) +
+		first_stripe_index * mddev->chunk_sectors; 
+    // 同上
+	end_disk_offset = ((int)(end - last_stripe_index * stripe_size) %
+		mddev->chunk_sectors) +
+		last_stripe_index * mddev->chunk_sectors;
+
+	for (disk = 0; disk < zone->nb_dev; disk++) {
+		sector_t dev_start, dev_end;
+		struct md_rdev *rdev;
+		int compare_disk;
+
+		compare_disk = map_disk_shift(disk, zone->nb_dev,
+					      zone->disk_shift);
+					      
+        // 这里开始记录转换之后目标设备在逻辑扇区中的位置
+        
+        // 设备在起点之前，没有在当前范围中
+		if (compare_disk < start_disk_index)
+		    // 将该设备的下一块 chunk 作为候选区
+			dev_start = (first_stripe_index + 1) *
+				mddev->chunk_sectors; 
+		// 设备在起点之后，将这一块作为起始处理区
+		else if (compare_disk > start_disk_index)
+			dev_start = first_stripe_index * mddev->chunk_sectors;
+		else
+			dev_start = start_disk_offset;
+		
+        // 	设备在终点之前
+		if (compare_disk < end_disk_index)
+		    // 将终止位置调整到最后一个条带的下一个条带
+			dev_end = (last_stripe_index + 1) * mddev->chunk_sectors;
+		else if (compare_disk > end_disk_index)
+		    // 否则终止位置就在这个条带上
+			dev_end = last_stripe_index * mddev->chunk_sectors;
+		else
+			dev_end = end_disk_offset;
+			
+		if (dev_end <= dev_start)
+			continue;
+        
+        // 找到 dev_list 中对应设备的下标
+		rdev = conf->devlist[(zone - conf->strip_zone) *
+			conf->strip_zone[0].nb_dev + disk];
+		// 调用 md 的函数
+		md_submit_discard_bio(mddev, rdev, bio,
+			dev_start + zone->dev_start + rdev->data_offset,
+			dev_end - dev_start);
+	}
+	bio_endio(bio);
+}
+```
+
+这个函数的主要功能是告知块设备哪些地址在后续的提交过程中不再需要。其主要目的是确定这段不再需要的数据是在哪个设备上，这个设备在逻辑扇区的什么位置。
