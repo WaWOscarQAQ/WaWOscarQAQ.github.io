@@ -1,3 +1,11 @@
+---
+title: 多设备管理驱动（Linux MD）
+date: 2026-11-17 20:17:17
+# Cover source: https://wallhaven.cc/w/v9w883
+thumbnail: /images/covers/linux-md-thumbnail.webp
+cover: /images/covers/linux-md.webp
+---
+
 # 多设备管理驱动（Linux MD）
 
 MD 的全称是 Multiple devices driver support ，在 `drivers/md/Kconfig`中描述为：
