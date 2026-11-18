@@ -859,6 +859,425 @@ static int bind_rdev_to_array(struct md_rdev *rdev, struct mddev *mddev)
 }
 ```
 
+## 3 阵列运行
 
+在 2.2.2 中，还有一个`RUN_ARRAY` ioctl 指令没有进行学习，这个系统调用涉及到阵列运行的相关流程。在`md_ioctl`函数中，可以发现对应该 ioctl 指令的函数为`do_md_run`，于是我们先从这个函数出发。
+
+### 3.1 `do_md_run`
+
+这个函数主要是外层函数，其中的核心是`md_run`。在进行初始化之后，函数按需添加位图，更新 md 块设备容量，通知用户态。
+
+```c
+int do_md_run(struct mddev *mddev)
+{
+	int err;
+
+    // 检测是否情动完成
+	set_bit(MD_NOT_READY, &mddev->flags); 
+	err = md_run(mddev); // 调用核心初始化函数
+	if (err)
+		goto out;
+
+    // 按照需求添加位图
+	if (md_bitmap_registered(mddev)) {
+		err = mddev->bitmap_ops->load(mddev);
+		if (err) {
+			md_bitmap_destroy(mddev);
+			goto out;
+		}
+	}
+
+	if (mddev_is_clustered(mddev))
+		md_allow_write(mddev);
+
+    // 执行额外任务，唤醒同步线程
+	/* run start up tasks that require md_thread */
+	md_start(mddev);
+
+	md_wakeup_thread(mddev->sync_thread); /* possibly kick off a reshape */
+
+    // 更新 MD 块设备容量，结束未就绪状态
+	set_capacity_and_notify(mddev->gendisk, mddev->array_sectors);
+	clear_bit(MD_NOT_READY, &mddev->flags);
+	// 记录变化，通知用户态
+	mddev->changed = 1;
+	kobject_uevent(&disk_to_dev(mddev->gendisk)->kobj, KOBJ_CHANGE);
+	sysfs_notify_dirent_safe(mddev->sysfs_state);
+	sysfs_notify_dirent_safe(mddev->sysfs_action);
+	sysfs_notify_dirent_safe(mddev->sysfs_degraded);
+out:
+	clear_bit(MD_NOT_READY, &mddev->flags);
+	return err;
+}
+```
+
+我们的核心需求是了解`md_run`。
+
+### 3.2 `md_run`
+
+这段代码超级长，我们采用分段的方式进行读取：
+
+```c
+int md_run(struct mddev *mddev)
+```
+
+在函数入口处对阵列进行了一系列检查：
+
+- 是否有成员设备；
+
+- 是否已经绑定 RAID 实现；
+
+- 之前的清理工作是否完成；
+
+- 若阵列成员数量没有确定，需要从超级块中恢复配置；
+
+> 复习一下 `mddev->disks`和`mddev->raid_disks`区别：
+>
+> disks 是实际绑定的设备数；
+>
+> raid_disks 是记录了阵列配置了多少个活动成员槽位。
+
+```c
+int err;
+struct md_rdev *rdev;
+struct md_personality *pers;
+
+if (list_empty(&mddev->disks))
+    /* cannot run an array with no devices.. */
+    return -EINVAL;
+
+if (mddev->pers)
+    return -EBUSY;
+/* Cannot run until previous stop completes properly */
+if (mddev->sysfs_active)
+    return -EBUSY;
+
+if (!mddev->raid_disks) {
+    if (!mddev->persistent)
+        return -EINVAL;
+    err = analyze_sbs(mddev);
+    if (err)
+        return -EINVAL;
+}
+```
+
+这段函数中，需要重点关注一下超级块识别函数`analyze_sbs()`：
+
+---
+
+**`analyze_sbs`阅读**
+
+```c
+static int analyze_sbs(struct mddev *mddev)
+{
+	struct md_rdev *rdev, *freshest, *tmp;
+
+	freshest = NULL;
+	rdev_for_each_safe(rdev, tmp, mddev)
+		switch (super_types[mddev->major_version].
+			load_super(rdev, freshest, mddev->minor_version)) {
+		case 1:
+			freshest = rdev;
+			break;
+		case 0:
+			break;
+		default:
+			pr_warn("md: fatal superblock inconsistency in %pg -- removing from array\n",
+				rdev->bdev);
+			md_kick_rdev_from_array(rdev);
+		}
+
+	/* Cannot find a valid fresh disk */
+	if (!freshest) {
+		pr_warn("md: cannot find a valid disk\n");
+		return -EINVAL;
+	}
+
+	super_types[mddev->major_version].
+		validate_super(mddev, NULL/*freshest*/, freshest);
+
+	rdev_for_each_safe(rdev, tmp, mddev) {
+		if (mddev->max_disks &&
+		    rdev->desc_nr >= mddev->max_disks) {
+			pr_warn("md: %s: %pg: only %d devices permitted\n",
+				mdname(mddev), rdev->bdev,
+				mddev->max_disks);
+			md_kick_rdev_from_array(rdev);
+			continue;
+		}
+		if (rdev != freshest) {
+			if (super_types[mddev->major_version].
+			    validate_super(mddev, freshest, rdev)) {
+				pr_warn("md: kicking non-fresh %pg from array!\n",
+					rdev->bdev);
+				md_kick_rdev_from_array(rdev);
+				continue;
+			}
+		}
+		// delta_disk 一般就是 0
+		if (rdev->raid_disk >= (mddev->raid_disks - min(0, mddev->delta_disks)) &&
+		    !test_bit(Journal, &rdev->flags)) {
+			rdev->raid_disk = -1;
+			clear_bit(In_sync, &rdev->flags);
+		}
+	}
+
+	return 0;
+}
+```
+
+首先遍历所有设备，将最新设备放到`freshest`指针下，踢掉不符合要求的设备。
+
+> 对于 `load_super` 函数，合法返回值为 1 或 0：1 代表当前超级块为最新（在事件层面最新），0 表示通过检查但与 freshest 相比不是最新的，负数表示非法，需要踢除。
+
+接着调用`validate_super`函数对`mddev`进行初始化，设置成员盘角色，在这之后 `raid_disks` 不为 0。
+
+之后，对于`rdev`设备号超过`mddev`最大设备数（如果有），踢掉这个设备；对于比较旧的设备，再次调用`validate_super`函数设置成员盘角色。
+
+检查成员盘 RAID 槽位编号是否越界，槽位越界，且不是日志设备时将 `raid_disk`设置为 -1，进入备选盘。
+
+---
+
+---
+
+**`super_1_validate`阅读**
+
+```c
+static int super_1_validate(struct mddev *mddev, struct md_rdev *freshest, struct md_rdev *rdev)
+{
+	struct mdp_superblock_1 *sb = page_address(rdev->sb_page);
+	__u64 ev1 = le64_to_cpu(sb->events);
+	int role;
+
+	rdev->raid_disk = -1;
+	clear_bit(Faulty, &rdev->flags);
+	clear_bit(In_sync, &rdev->flags);
+	clear_bit(Bitmap_sync, &rdev->flags);
+	clear_bit(WriteMostly, &rdev->flags);
+
+	if (mddev->raid_disks == 0) { // 会进入这个分支，根据最新设备超级块信息
+	                              // 设置整个阵列的 mddev
+	                              // 有必要时后面会详细说明
+        ...
+        // 这里值得注意的几个参数
+        // level          RAID 级别
+        // layout         采用布局（比如 RAID 0 中的两个）
+        // chunk_sectors  一个 chunk 的扇区数
+        // raid_disks     活动成员槽位数
+        // dev_sectors    超级块记录的成员容量
+	} else if (mddev->pers == NULL) { // 进入分支，因为阵列还没有初始化
+		// 检查 rdev 的 desc_nr 是否合法
+		// 检查设备是否是日志盘或者普通活动槽位
+		// 成员设备事件比主设备事件落后超过 1,就直接报错
+		if (rdev->desc_nr >= 0 &&
+		    rdev->desc_nr < le32_to_cpu(sb->max_dev) &&
+		    (le16_to_cpu(sb->dev_roles[rdev->desc_nr]) < MD_DISK_ROLE_MAX ||
+		     le16_to_cpu(sb->dev_roles[rdev->desc_nr]) == MD_DISK_ROLE_JOURNAL))
+			if (ev1 + 1 < mddev->events)
+				return -EINVAL;
+	} else if (mddev->bitmap) {
+		if (ev1 < md_bitmap_events_cleared(mddev))
+			return 0;
+		if (ev1 < mddev->events)
+			set_bit(Bitmap_sync, &rdev->flags);
+	} else {
+		if (ev1 < mddev->events)
+			/* just a hot-add of a new device, leave raid_disk at -1 */
+			return 0;
+	}
+
+
+    /* ------ 设备角色确定 ------ */
+	if (rdev->desc_nr < 0 ||
+	    rdev->desc_nr >= le32_to_cpu(sb->max_dev)) {
+		role = MD_DISK_ROLE_SPARE; // 设置为备用盘
+		rdev->desc_nr = -1;
+	} else if (mddev->pers == NULL && freshest && ev1 < mddev->events) {
+	    // 在组装时，当前成员设备 event 计数器小于最高值，超级块将不再可信
+	    // 这可能是因为 rdev 被标记为坏，其他设备超级块都进行 +1
+	    // 系统在下次超级块更新之前崩溃或者重启，这次更新可能发生在故障设备移出阵列时
+	    // 如果不查阅最新超级块，就允许当前成员加入阵列，可能造成数据破坏
+	    // 这种情况下，当前成员事件计数比最高值少 1，落后更多成员就无法加入阵列
+	    // mdadm 和内核允许事件计数落后一位
+	    
+        // 查询最新设备的超级块，获取当前块的设备角色
+		struct mdp_superblock_1 *freshest_sb = page_address(freshest->sb_page);
+		u32 freshest_max_dev = le32_to_cpu(freshest_sb->max_dev);
+		// 换表之后检查当前设备描述符是否超过最新表长度
+		// 因为旧表设备数可能与新表不一致
+		if (rdev->desc_nr >= freshest_max_dev) { 
+			/* this is unexpected, better not proceed */
+			pr_warn("md: %s: rdev[%pg]: desc_nr(%d) >= freshest(%pg)->sb->max_dev(%u)\n",
+				mdname(mddev), rdev->bdev, rdev->desc_nr,
+				freshest->bdev, freshest_max_dev);
+			return -EUCLEAN;
+		}
+
+        // 从最新设备中找到本设备的角色
+		role = le16_to_cpu(freshest_sb->dev_roles[rdev->desc_nr]);
+		pr_debug("md: %s: rdev[%pg]: role=%d(0x%x) according to freshest %pg\n",
+			 mdname(mddev), rdev->bdev, role, role, freshest->bdev);
+	} else {
+	    // 其他情况就自己查自己超级块
+		role = le16_to_cpu(sb->dev_roles[rdev->desc_nr]);
+	}
+	
+	switch (role) {
+	case MD_DISK_ROLE_SPARE: // 备用跳过
+		break;
+	case MD_DISK_ROLE_FAULTY: // 标记坏设备
+		set_bit(Faulty, &rdev->flags);
+		break;
+	case MD_DISK_ROLE_JOURNAL: // 日志设备
+	    // 确认是否超级块启用日志功能
+		if (!(le32_to_cpu(sb->feature_map) & MD_FEATURE_JOURNAL)) {
+			/* journal device without journal feature */
+			pr_warn("md: journal device provided without journal feature, ignoring the device\n");
+			return -EINVAL;
+		}
+		// 设置日志标志
+		set_bit(Journal, &rdev->flags);
+		// 恢复日志尾部
+		rdev->journal_tail = le64_to_cpu(sb->journal_tail);
+		rdev->raid_disk = 0;
+		break;
+	default: // 成员盘
+		rdev->saved_raid_disk = role;
+		// 决定盘数据是否同步
+		if ((le32_to_cpu(sb->feature_map) &
+		     MD_FEATURE_RECOVERY_OFFSET)) {
+		    /* 有恢复标记，读出 recovery_offset */
+		    // recovery_offset 表示偏移之前的扇区已经恢复
+			rdev->recovery_offset = le64_to_cpu(sb->recovery_offset);
+			if (!(le32_to_cpu(sb->feature_map) &
+			      MD_FEATURE_RECOVERY_BITMAP))
+			    /* 没有位图引导，把 saved_raid_disk 设置为 -1 */
+				rdev->saved_raid_disk = -1;
+		} else {
+		    /* 没有恢复标记 */
+			if (!test_bit(MD_RECOVERY_FROZEN,
+				      &mddev->recovery))
+				/* 阵列恢复没有被冻结，设置 In_sync，表示成员同步 */
+				set_bit(In_sync, &rdev->flags);
+		}
+		// 根据 role 选定槽位
+		rdev->raid_disk = role;
+		break;
+	}
+	
+    // 
+	if (sb->devflags & WriteMostly1)
+		set_bit(WriteMostly, &rdev->flags);
+	if (sb->devflags & FailFast1)
+		set_bit(FailFast, &rdev->flags);
+	if (le32_to_cpu(sb->feature_map) & MD_FEATURE_REPLACEMENT)
+		set_bit(Replacement, &rdev->flags);
+
+	return 0;
+}
+```
+
+这个函数比较复杂，主要是实现了以下过程：
+
+- 对于 1.X MD RAID，会有 `raid_disks = 0` 的情况 ，这是内核会根据前面找到的最新设备的超级块，读取 `mddev`设备上的相关信息；
+
+- 检查设备号是否合理，之后检查设备是否为槽位设备或日志设备，在这种情况下设备的`event`不能比主设备落后超过 1；
+
+- 确定设备角色：
+
+  - 对于设备号错误的设备，设置为备用盘；
+
+  - 对于设备`event`比主设备落后 1 的设备，查询最新设备超级块，重新进行设备号校验之后读取角色；
+
+  - 其他设备查自己的超级块就好；
+
+- 根据设备角色进行不同操作：
+
+  - 对坏设备进行标记；
+
+  - 设置日志设备标记，恢复对应重启日志位置；
+
+  - 对成员盘，首先决定设备是否需要恢复和同步，之后根据 role 数值确定成员盘的槽位。
+
+**raid_disks 是在这个函数设置的。**
+
+---
+
+之后，我们回到`md_run`中，继续阅读代码：
+
+```c
+// 按需请求，节约资源
+if (mddev->level != LEVEL_NONE)
+    request_module("md-level-%d", mddev->level);
+else if (mddev->clevel[0])
+    request_module("md-%s", mddev->clevel);
+
+/*
+    * Drop all container device buffers, from now on
+    * the only valid external interface is through the md
+    * device.
+    */
+clear_bit(MD_HAS_SUPERBLOCK, &mddev->flags);
+rdev_for_each(rdev, mddev) {
+    if (test_bit(Faulty, &rdev->flags)) // 跳过故障盘
+        continue;
+    sync_blockdev(rdev->bdev); // 写回该块设备的脏页并等待完成
+    invalidate_bdev(rdev->bdev); // 丢弃可丢弃缓存
+    
+    
+    if (mddev->ro != MD_RDONLY && rdev_read_only(rdev)) {
+        /* 设备盘是否能只读启动 */
+        mddev->ro = MD_RDONLY; // 将整个阵列也设置为只读模式
+        if (!mddev_is_dm(mddev))
+            set_disk_ro(mddev->gendisk, 1);
+    }
+
+    if (rdev->sb_page)
+        /* 是否有成员有超级块内存页 */
+        // 将整个阵列都设置整有超级块内存页
+        set_bit(MD_HAS_SUPERBLOCK, &mddev->flags);
+
+    /* perform some consistency tests on the device.
+     * We don't want the data to overlap the metadata,
+     * Internal Bitmap issues have been handled elsewhere.
+     */
+    if (rdev->meta_bdev) { 
+        /* Nothing to check */;
+    } else if (rdev->data_offset < rdev->sb_start) {
+        // 如果 rdev 的数据开始区域在超级块区域之后
+        if (mddev->dev_sectors &&
+            rdev->data_offset + mddev->dev_sectors
+            > rdev->sb_start) {
+            // 如果 rdev 数据区包括超级块区域，造成数据覆写超级块报错
+            // |---------| rdev->data_offset
+            //     |------------| sb
+            pr_warn("md: %s: data overlaps metadata\n",
+                mdname(mddev));
+            return -EINVAL;
+        }
+    } else {
+        if (rdev->sb_start + rdev->sb_size/512
+            > rdev->data_offset) { 
+            // 如果超级块结束位置在 rdev 开始位置之后，造成超级块覆写数据错误
+            //    |---------| rdev->data_offset
+            //  |------| sb
+            pr_warn("md: %s: metadata overlaps data\n",
+                mdname(mddev));
+            return -EINVAL;
+        }
+    }
+    sysfs_notify_dirent_safe(rdev->sysfs_state);
+}
+```
+
+这段代码主要对每块设备进行下一步检查：
+
+- 刷掉原来设备内容；
+
+- 检查成员盘是否有只读或者有超级块标记，如果有扩展到整个盘上；
+
+- 检查是否超级块和数据区有互相覆写的情况；
+
+- 通知用户重新读取成员盘状态。
 
 
