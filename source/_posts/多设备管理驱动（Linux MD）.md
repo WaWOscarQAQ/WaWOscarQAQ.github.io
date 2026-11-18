@@ -1165,7 +1165,7 @@ static int super_1_validate(struct mddev *mddev, struct md_rdev *freshest, struc
 		break;
 	}
 	
-    // 
+  
 	if (sb->devflags & WriteMostly1)
 		set_bit(WriteMostly, &rdev->flags);
 	if (sb->devflags & FailFast1)
@@ -1279,5 +1279,150 @@ rdev_for_each(rdev, mddev) {
 - 检查是否超级块和数据区有互相覆写的情况；
 
 - 通知用户重新读取成员盘状态。
+
+接下来开始确定 RAID 的 personality：
+
+```c
+//从已经注册的 RAID 实现中，找到当前阵列需要使用的操作表
+pers = get_pers(mddev->level, mddev->clevel);
+
+if (!pers)
+    return -EINVAL;
+
+// 当前 md 设备的 level 和 pers 的 id 不符合，修正过来    
+if (mddev->level != pers->head.id) {
+    mddev->level = pers->head.id;
+    mddev->new_level = pers->head.id;
+}
+
+// 粘贴 pers 名字
+strscpy(mddev->clevel, pers->head.name, sizeof(mddev->clevel));
+
+// 检查当前 RAID 是否能够实现阵列尚未完成的布局转换
+if (mddev->reshape_position != MaxSector &&
+    pers->start_reshape == NULL) {
+    // 当前阵列不能处理布局转换
+    /* This personality cannot handle reshaping... */
+    put_pers(pers); // 释放
+    return -EINVAL;
+}
+
+// 是否有同步回调
+if (pers->sync_request) {
+    /* Warn if this is a potentially silly
+        * configuration.
+        */
+    struct md_rdev *rdev2;
+    int warned = 0;
+    
+    // 检查是否有两个 rdev 的物理设备同一个磁盘上
+    rdev_for_each(rdev, mddev)
+        rdev_for_each(rdev2, mddev) {
+            if (rdev < rdev2 &&
+                rdev->bdev->bd_disk ==
+                rdev2->bdev->bd_disk) {
+                pr_warn("%s: WARNING: %pg appears to be on the same physical disk as %pg.\n",
+                    mdname(mddev),
+                    rdev->bdev,
+                    rdev2->bdev);
+                warned = 1;
+            }
+        }
+
+    if (warned)
+        pr_warn("True protection against single-disk failure might be compromised.\n");
+}
+
+/* dm-raid expect sync_thread to be frozen until resume */
+// 不是 dm 设备关闭 recovery
+if (!mddev_is_dm(mddev))
+    mddev->recovery = 0;
+
+// 阵列最大同步偏移
+mddev->resync_max_sectors = mddev->dev_sectors;
+
+// 是否运行降级的脏阵列
+// 当一个raid5/6为脏并且降级时，就可能有数据错误的风险。
+// 为脏就是校验盘数据未经过同步，再加上降级就表示这一条带数据无法通过重建来恢复
+// 所以 md 不直接去运行阵列，而是由系统管理员手动运行
+mddev->ok_start_degraded = start_dirty_degraded;
+
+// 如果设置了 start_ro, 阵列原本是可读写的，就使用 read_auto 模式启动
+if (start_readonly && md_is_rdwr(mddev))
+    mddev->ro = MD_AUTO_READ; /* read-only, but switch on first write */
+```
+
+这一段主要实现了读取 RAID  模板、检测当前阵列是否存在两个成员盘来自一个磁盘的不同分区这种情况，最后设置最大同步偏移、处理降级的脏阵列。后面在学习 RAID 5 的时候我们会详细了解。
+
+```c
+err = pers->run(mddev); // 很重要
+if (err)
+    pr_warn("md: pers->run() failed ...\n");
+else if (pers->size(mddev, 0, 0) < mddev->array_sectors) {
+    WARN_ONCE(!mddev->external_size,
+            "%s: default size too small, but 'external_size' not in effect?\n",
+            __func__);
+    pr_warn("md: invalid array_size %llu > default size %llu\n",
+        (unsigned long long)mddev->array_sectors / 2,
+        (unsigned long long)pers->size(mddev, 0, 0) / 2);
+    err = -EINVAL;
+}
+if (err == 0 && pers->sync_request &&
+    (mddev->bitmap_info.file || mddev->bitmap_info.offset)) {
+    err = md_bitmap_create(mddev);
+    if (err)
+        pr_warn("%s: failed to create bitmap (%d)\n",
+            mdname(mddev), err);
+}
+if (err)
+    goto bitmap_abort;
+```
+
+这一段中，最重要的在于 `pers->run(mddev)`这个就是对应`raid`的具体实现，我们这里以 `raid0_run()`为例：
+
+```c
+static int raid0_run(struct mddev *mddev)
+{
+	struct r0conf *conf;
+	int ret;
+
+	if (mddev->chunk_sectors == 0) {
+		pr_warn("md/raid0:%s: chunk size must be set.\n", mdname(mddev));
+		return -EINVAL;
+	}
+	if (md_check_no_bitmap(mddev))
+		return -EINVAL;
+
+	if (!mddev_is_dm(mddev)) {
+		ret = raid0_set_limits(mddev);
+		if (ret)
+			return ret;
+	}
+
+	/* if private is not null, we are here after takeover */
+	if (mddev->private == NULL) {
+		ret = create_strip_zones(mddev, &conf); // 创建条带区
+		if (ret < 0)
+			return ret;
+		mddev->private = conf; // 接入 r0conf
+	}
+	conf = mddev->private;
+
+	/* calculate array device size */
+	md_set_array_sectors(mddev, raid0_size(mddev, 0, 0));
+
+	pr_debug("md/raid0:%s: md_size is %llu sectors.\n",
+		 mdname(mddev),
+		 (unsigned long long)mddev->array_sectors);
+
+	dump_zones(mddev);
+
+	return md_integrity_register(mddev);
+}
+```
+
+可以看到整个函数在进行了一系列检查之后，调用了`create_stripe_zone()`函数进行条带区的创建。
+
+函数的剩余部分与我们的主线任务无关，之后需要学习的时候再看。
 
 
